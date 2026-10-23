@@ -1,0 +1,27 @@
+{
+  "sheet_id": "PASTE_YOUR_SPREADSHEET_ID_HERE",
+  "sheet_tab": "Sheet1",
+  "url_column_header": "channel_url",
+  "service_account_file": "service_account.json",
+  "new_channel_lookback_days": 7,
+  "upload": {
+    "enabled": false,
+    "api_url": "https://api.nxtstps.dev/events",
+    "token_url": "https://api.nxtstps.dev/token",
+    "scope": "",
+    "client_auth": "basic",
+    "include_grant_type": false,
+    "event": {
+      "type": "resource",
+      "url": "{video_url}",
+      "title": "{video_title}",
+      "description": "New video from {channel_name}",
+      "tags": "youtube"
+    },
+    "description_max_chars": 500,
+    "payload_key": "",
+    "field_map": {},
+    "batch_size": 500,
+    "timeout_seconds": 30
+  }
+}

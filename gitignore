@@ -1,0 +1,21 @@
+# Secrets - never commit these
+service_account.json
+*.json.key
+.env
+
+# Your personal settings (config.example.json is the committed template)
+config.json
+service_account.json
+
+# Runtime state and output
+state.json
+channel_cache.json
+new_videos.csv
+*.log
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

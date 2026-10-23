@@ -3,10 +3,15 @@ service_account.json
 *.json.key
 .env
 
+# Your personal settings (config.example.json is the committed template)
+config.json
+
 # Runtime state and output
 state.json
 channel_cache.json
 new_videos.csv
+pending_upload.json
+rejected_uploads.json
 *.log
 *.tmp
 
