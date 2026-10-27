@@ -18,7 +18,7 @@ Design (in the spirit of Head First OOA&D):
     VideoPlatform     interface: find channels / list videos    -> YouTubePlatform
                                                                   CachedPlatform (decorator)
     VideoStore        interface: where results are saved        -> CsvVideoStore
-    VideoPublisher    interface: where new videos are sent on   -> EventApiPublisher
+    VideoPublisher    interface: where new videos are sent on   -> ApiPublisher
                                                                   RetryingPublisher (decorator)
                                                                   NullPublisher (uploads off)
     AccessTokenProvider  interface: OAuth tokens                -> PasswordGrantTokenProvider
@@ -30,6 +30,7 @@ Design (in the spirit of Head First OOA&D):
     implements the interface. Tracker never changes.
 """
 
+import argparse
 import csv
 import json
 import logging
@@ -41,7 +42,8 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from urllib.parse import urlparse
 
 import requests
 from google.oauth2 import service_account
@@ -91,6 +93,7 @@ class Channel:
     channel_id: str
     name: str
     uploads_playlist: str
+    country: str = ""          # ISO country code YouTube lists for the channel, if it set one
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,15 @@ ROW_FIELDS = ["fetched_at", "channel_url", "channel_name", "video_id",
 
 
 @dataclass
+class PublishReport:
+    """What one upload did. Returned by VideoPublisher.publish()."""
+    attempted: bool = True      # False when uploads are switched off
+    sent: int = 0               # videos the API accepted
+    rejected: int = 0           # videos the API refused (saved in rejected_uploads.json)
+    carried_over: int = 0       # of `sent`, how many were left over from earlier runs
+
+
+@dataclass
 class RunSummary:
     new: int = 0
     known: int = 0
@@ -144,6 +156,7 @@ class RunSummary:
     failed: int = 0
     videos_added: int = 0
     upload_failed: bool = False
+    upload: Optional[PublishReport] = None
 
     def describe(self) -> str:
         text = (f"Summary: {self.new} new channel(s), {self.known} known channel(s), "
@@ -151,6 +164,16 @@ class RunSummary:
                 f"{self.videos_added} video(s) added")
         if self.upload_failed:
             text += "; upload FAILED (queued for retry)"
+        elif self.upload is not None and self.upload.attempted:
+            up = self.upload
+            if up.sent == 0 and up.rejected == 0:
+                text += "; nothing to upload"
+            else:
+                text += f"; uploaded {up.sent} video(s)"
+                if up.carried_over:
+                    text += f" ({up.carried_over} from earlier runs)"
+                if up.rejected:
+                    text += f", {up.rejected} rejected by the API"
         return text
 
 
@@ -179,31 +202,40 @@ def _positive_int(name: str, value) -> int:
     return number
 
 
-# Placeholders usable in the 'event' templates of config.json.
-TEMPLATE_FIELDS = ROW_FIELDS + ["video_description"]
+# Placeholders usable in the 'payload' templates of config.json.
+TEMPLATE_FIELDS = ROW_FIELDS + ["video_description", "channel_country"]
 
-# What one video becomes when posted to the events API. Values are templates:
-# {video_title} and friends are filled in per video; everything else is sent as written.
-DEFAULT_EVENT = {
-    "type": "resource",
+# The body posted to the API for each video. Text values are templates: {video_title} and
+# friends are filled in per video, and the rest of the text is sent as written. True/False,
+# numbers and objects are sent exactly as given. A text value that comes out empty (say, a
+# channel with no country) is left out of the request.
+DEFAULT_PAYLOAD = {
     "url": "{video_url}",
+    "type": "resource",
+    "source": "{channel_name}",
     "title": "{video_title}",
-    "description": "New video from {channel_name}",
+    "description": "{video_description}",
     "tags": "youtube",
+    "image_url": "https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+    "country": "{channel_country}",
+    "check_duplicate": True,
 }
 
 
-def _check_template(key: str, template) -> None:
-    if not isinstance(template, str):
-        raise ConfigError(f"upload.event.{key} must be text (got {template!r}).")
+def _check_payload_value(key: str, value) -> None:
+    if isinstance(value, (bool, int, float, dict, list)):
+        return   # sent exactly as written
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"upload.payload.{key} must be text, true/false, a number or an object (got {value!r}).")
     try:
-        names = [name for _, name, _, _ in string.Formatter().parse(template) if name is not None]
+        names = [name for _, name, _, _ in string.Formatter().parse(value) if name is not None]
     except ValueError as e:
-        raise ConfigError(f"upload.event.{key} is not a valid template: {e}") from e
+        raise ConfigError(f"upload.payload.{key} is not a valid template: {e}") from e
     unknown = sorted(set(names) - set(TEMPLATE_FIELDS))
     if unknown:
         raise ConfigError(
-            f"upload.event.{key} uses unknown placeholder(s) {unknown}; valid ones: {TEMPLATE_FIELDS}")
+            f"upload.payload.{key} uses unknown placeholder(s) {unknown}; valid ones: {TEMPLATE_FIELDS}")
 
 
 @dataclass(frozen=True)
@@ -215,7 +247,7 @@ class UploadSettings:
     scope: str = ""
     client_auth: str = "basic"          # "basic" = HTTP Basic header, "body" = client_id/secret in the form
     include_grant_type: bool = True     # false = send only username + password to the token endpoint
-    event: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_EVENT))
+    payload: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_PAYLOAD))
     description_max_chars: int = 500    # the "description" value is cut to this length
     timeout_seconds: int = 30
 
@@ -227,6 +259,11 @@ class UploadSettings:
             raise ConfigError("'upload' in config.json must be an object.")
         if not raw.get("enabled", False):
             return cls()
+
+        if "event" in raw:
+            raise ConfigError(
+                "upload.event was renamed to upload.payload. Replace it with the 'payload' block "
+                "from config.example.json.")
 
         api_url = str(raw.get("api_url", "")).strip()
         token_url = str(raw.get("token_url", "")).strip()
@@ -243,13 +280,13 @@ class UploadSettings:
         if not isinstance(include_grant_type, bool):
             raise ConfigError("upload.include_grant_type must be true or false.")
 
-        event = raw.get("event")
-        if event is None:
-            event = dict(DEFAULT_EVENT)
-        elif not isinstance(event, dict) or not event:
-            raise ConfigError("upload.event must be an object of API field names and values.")
-        for key, template in event.items():
-            _check_template(key, template)
+        payload = raw.get("payload")
+        if payload is None:
+            payload = dict(DEFAULT_PAYLOAD)
+        elif not isinstance(payload, dict) or not payload:
+            raise ConfigError("upload.payload must be an object of API field names and values.")
+        for key, value in payload.items():
+            _check_payload_value(key, value)
 
         return cls(
             enabled=True,
@@ -258,7 +295,7 @@ class UploadSettings:
             scope=str(raw.get("scope", "")).strip(),
             client_auth=client_auth,
             include_grant_type=include_grant_type,
-            event=dict(event),
+            payload=dict(payload),
             description_max_chars=_positive_int("description_max_chars", raw.get("description_max_chars", 500)),
             timeout_seconds=_positive_int("timeout_seconds", raw.get("timeout_seconds", 30)),
         )
@@ -514,6 +551,7 @@ class YouTubePlatform(VideoPlatform):
                 channel_id=item["id"],
                 name=item["snippet"]["title"],
                 uploads_playlist=item["contentDetails"]["relatedPlaylists"]["uploads"],
+                country=item["snippet"].get("country", ""),
             )
         return None
 
@@ -556,19 +594,31 @@ class CachedPlatform(VideoPlatform):
         self._inner = inner
         self._file = cache_file
         self._channels: Dict[str, Channel] = {}
+        self._stale: Set[str] = set()   # cached before channels had a country: look up once more
         for url, fields in cache_file.load({}).items():
             try:
                 self._channels[url] = Channel(**fields)
             except TypeError:
                 continue   # malformed entry: just look it up again
+            if "country" not in fields:
+                self._stale.add(url)
 
     def find_channel(self, url: str) -> Optional[Channel]:
-        if url in self._channels:
-            return self._channels[url]
-        channel = self._inner.find_channel(url)
-        if channel is not None:
-            self._channels[url] = channel
-            self._file.save({u: asdict(c) for u, c in self._channels.items()})
+        cached = self._channels.get(url)
+        if cached is not None and url not in self._stale:
+            return cached
+        try:
+            channel = self._inner.find_channel(url)
+        except Exception:
+            if cached is None:
+                raise
+            log.warning("Could not refresh cached channel %s; using the saved copy", url)
+            return cached
+        if channel is None:
+            return cached   # nothing came back: keep what we had (still None if never cached)
+        self._channels[url] = channel
+        self._stale.discard(url)
+        self._file.save({u: asdict(c) for u, c in self._channels.items()})
         return channel
 
     def videos_since(self, channel: Channel, since: datetime) -> List[Video]:
@@ -623,15 +673,22 @@ class CsvVideoStore(VideoStore):
 
 class VideoPublisher(ABC):
     @abstractmethod
-    def publish(self, records: List[ScrapeRecord]) -> None:
+    def publish(self, records: List[ScrapeRecord]) -> PublishReport:
         """Send records onward. On failure raise PublishError(delivered=<how many got through>)."""
+
+    def check_connection(self) -> str:
+        """Test the connection without sending anything. Raise PublishError if it fails."""
+        return "No connection check is available for this publisher."
 
 
 class NullPublisher(VideoPublisher):
     """Null Object: used when uploads are off, so Tracker never has to check."""
 
-    def publish(self, records: List[ScrapeRecord]) -> None:
-        return
+    def publish(self, records: List[ScrapeRecord]) -> PublishReport:
+        return PublishReport(attempted=False)
+
+    def check_connection(self) -> str:
+        return "Uploads are switched off (upload.enabled is not true in config.json)."
 
 
 def _describe_error(response) -> str:
@@ -733,19 +790,20 @@ class PasswordGrantTokenProvider(AccessTokenProvider):
         except (TypeError, ValueError):
             self._expires_at = None   # no expiry given: keep the token until the API says 401
         self._token = token
+        log.info("Logged in to %s", urlparse(self._token_url).netloc)
 
 
-class EventApiPublisher(VideoPublisher):
+class ApiPublisher(VideoPublisher):
     """
-    POSTs one JSON event per video (the API answers 202 Accepted), authenticating
+    POSTs one JSON body per video to upload.api_url, authenticating
     with a bearer token. What goes wrong is sorted into three kinds:
 
       accepted        any 2xx.
-      rejected        400/409/413/422: this one event is the problem (bad data, or the
+      rejected        400/409/413/422: this one video is the problem (bad data, or the
                       API already has it). It is logged, saved in rejected_uploads.json
-                      and skipped, so it can't block the events behind it.
+                      and skipped, so it can't block the videos behind it.
       retry later     everything else (401 after a fresh token, 403, 404, 429, 5xx,
-                      network errors): not the event's fault. Stop and raise
+                      network errors): not the video's fault. Stop and raise
                       PublishError so the rest stays queued for the next run.
     """
 
@@ -755,15 +813,15 @@ class EventApiPublisher(VideoPublisher):
     def __init__(self, settings: UploadSettings, tokens: AccessTokenProvider,
                  session=None, rejected_file: Optional[JsonFile] = None):
         self._url = settings.api_url
-        self._event = settings.event
+        self._payload = settings.payload
         self._max_description = settings.description_max_chars
         self._timeout = settings.timeout_seconds
         self._tokens = tokens
         self._session = session or requests.Session()
         self._rejected_file = rejected_file
 
-    def publish(self, records: List[ScrapeRecord]) -> None:
-        rejected: List[tuple] = []   # (record, reason) for events the API refused
+    def publish(self, records: List[ScrapeRecord]) -> PublishReport:
+        rejected: List[tuple] = []   # (record, reason) for videos the API refused
         streak: List[tuple] = []     # (index, record, reason) refused back to back
         try:
             for index, record in enumerate(records):
@@ -779,32 +837,44 @@ class EventApiPublisher(VideoPublisher):
                 streak.append((index, record, reason))
                 if len(streak) >= self.MAX_CONSECUTIVE_REJECTIONS:
                     raise PublishError(
-                        f"The API rejected {len(streak)} events in a row ({reason}). Check the "
-                        f"'event' settings; stopping so nothing is discarded.",
+                        f"The API rejected {len(streak)} videos in a row ({reason}). Check the "
+                        f"'payload' settings; stopping so nothing is discarded.",
                         delivered=streak[0][0])
             rejected.extend((r, why) for _, r, why in streak)
         finally:
             self._remember_rejections(rejected)
+        return PublishReport(sent=len(records) - len(rejected), rejected=len(rejected))
 
-    def _event_for(self, record: ScrapeRecord) -> Dict[str, str]:
-        values = dict(record.to_row(), video_description=record.video.description)
-        event = {}
-        for key, template in self._event.items():
+    def check_connection(self) -> str:
+        self._tokens.get_token()   # raises PublishError if the login fails
+        return f"Login to the upload API works. Videos would be sent to {self._url}"
+
+    def _body_for(self, record: ScrapeRecord) -> Dict[str, Any]:
+        values = dict(record.to_row(), video_description=record.video.description,
+                      channel_country=record.channel.country)
+        body: Dict[str, Any] = {}
+        for key, template in self._payload.items():
+            if not isinstance(template, str):
+                body[key] = template   # true/false, numbers and objects go out exactly as written
+                continue
             filled_from = values
             if key == "tags":   # tags are comma separated, so a comma inside a value would split it
                 filled_from = {k: v.replace(",", " ") for k, v in values.items()}
             text = template.format_map(filled_from)
-            event[key] = text[:self._max_description] if key == "description" else text
-        return event
+            if key == "description":
+                text = text[:self._max_description]
+            if text.strip():   # an empty value (no description, no country) is simply not sent
+                body[key] = text
+        return body
 
     def _send(self, record: ScrapeRecord) -> Optional[str]:
-        """None if the API accepted the event, or the reason if it refused this event."""
-        event = self._event_for(record)
+        """None if the API accepted the video, or the reason if it refused this one."""
+        body = self._body_for(record)
         for attempt in (1, 2):
             token = self._tokens.get_token()
             try:
                 response = self._session.post(
-                    self._url, json=event, timeout=self._timeout,
+                    self._url, json=body, timeout=self._timeout,
                     headers={"Authorization": f"Bearer {token}"})
             except requests.RequestException as e:
                 raise PublishError(f"Could not reach the API: {e}") from e
@@ -840,14 +910,15 @@ class RetryingPublisher(VideoPublisher):
         self._inner = inner
         self._file = pending_file
 
-    def publish(self, records: List[ScrapeRecord]) -> None:
+    def publish(self, records: List[ScrapeRecord]) -> PublishReport:
         pending = self._load_pending()
         to_send = pending + list(records)
         if not to_send:
-            return
+            log.info("Nothing to upload.")
+            return PublishReport()
 
         try:
-            self._inner.publish(to_send)
+            report = self._inner.publish(to_send)
         except PublishError as e:
             remaining = to_send[e.delivered:]
             self._save_pending(remaining)
@@ -856,7 +927,13 @@ class RetryingPublisher(VideoPublisher):
                 delivered=e.delivered) from e
 
         self._save_pending([])
-        log.info("Uploaded %d record(s) (%d left over from earlier runs)", len(to_send), len(pending))
+        report.carried_over = len(pending)
+        log.info("Uploaded %d video(s) (%d left over from earlier runs, %d rejected by the API)",
+                 report.sent, report.carried_over, report.rejected)
+        return report
+
+    def check_connection(self) -> str:
+        return self._inner.check_connection()
 
     def _load_pending(self) -> List[ScrapeRecord]:
         loaded = []
@@ -993,7 +1070,7 @@ class Tracker:
         # Upload last, after everything is safely on disk. A failed upload never undoes
         # the scrape: the publisher queues what didn't go through for the next run.
         try:
-            self._publisher.publish(records)
+            summary.upload = self._publisher.publish(records)
         except PublishError as e:
             log.error("Upload failed: %s", e)
             summary.upload_failed = True
@@ -1024,7 +1101,7 @@ def build_publisher(upload: UploadSettings) -> VideoPublisher:
         send_grant_type=upload.include_grant_type,
         timeout=upload.timeout_seconds,
     )
-    publisher = EventApiPublisher(upload, tokens, rejected_file=JsonFile(REJECTED_FILE))
+    publisher = ApiPublisher(upload, tokens, rejected_file=JsonFile(REJECTED_FILE))
     return RetryingPublisher(publisher, JsonFile(PENDING_FILE))
 
 
@@ -1059,13 +1136,27 @@ def configure_logging() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # avoid Windows cp1252 crashes
 
 
-def main() -> int:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Find new videos on the YouTube channels listed in a Google Sheet.")
+    parser.add_argument("--check-upload", action="store_true",
+                        help="only test the login to the upload API, then exit; nothing is scraped or sent")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
     configure_logging()
     try:
-        tracker = build_tracker(Settings.from_file(CONFIG_FILE), load_api_key())
-        summary = tracker.run()
+        settings = Settings.from_file(CONFIG_FILE)
+        if args.check_upload:
+            log.info("%s", build_publisher(settings.upload).check_connection())
+            return 0
+        summary = build_tracker(settings, load_api_key()).run()
     except (ConfigError, ChannelSourceError) as e:
         log.error("%s", e)
+        return 1
+    except PublishError as e:
+        log.error("Connection check failed: %s", e)
         return 1
     except Exception:
         log.exception("Unexpected failure")

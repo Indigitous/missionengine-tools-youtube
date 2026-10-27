@@ -52,33 +52,48 @@ is missed" so a sleeping machine catches up.
 All of the above, plus `service_account.json` and your `config.json`, are
 git-ignored. `config.example.json` is the committed template.
 
-## Uploading new videos to another API (optional)
+## Uploading new videos to the MissionEngine API (optional)
 
-After each run, the videos found in that run can be sent to another API, one
-`POST` per video, after logging in with the OAuth **password grant**. It is off
-unless `upload.enabled` is `true` in `config.json`. Each video becomes an event
-like this (the API replies `202 Accepted`):
+After each run, the videos found in that run can be sent to the API's `/events`
+endpoint: one `POST` per video, after logging in with the OAuth **password grant**.
+It is off unless `upload.enabled` is `true` in `config.json`. Each video becomes a
+body like this:
 
 ```json
-{"type": "resource", "url": "https://www.youtube.com/watch?v=...",
- "title": "Video title", "description": "New video from Channel", "tags": "youtube"}
+{"url": "https://www.youtube.com/watch?v=...",
+ "type": "resource",
+ "source": "Channel name",
+ "title": "Video title",
+ "description": "The video's YouTube description (first 500 characters)",
+ "tags": "youtube",
+ "image_url": "https://i.ytimg.com/vi/<video id>/hqdefault.jpg",
+ "country": "PH",
+ "check_duplicate": true}
 ```
 
+`country` is the country YouTube lists for the channel; channels that haven't set
+one send nothing for it. Any text value that comes out empty is left out.
+
 1. Fill in the `upload` block of `config.json` (see `config.example.json`):
-   - `api_url` / `token_url` - the events endpoint and the token endpoint
+   - `api_url` / `token_url` - the `/events` endpoint and the token endpoint
    - `include_grant_type` - `false` sends only `username` and `password` to the
      token endpoint (what the sample script does); `true` also sends
      `grant_type=password`, as the OAuth standard says
    - `scope`, `client_auth` - only needed if the API asks for them
-   - `event` - the JSON sent for each video. Values are templates; these
-     placeholders are filled in per video: `{video_url}`, `{video_title}`,
+   - `payload` - the JSON sent for each video. **Text** values are templates;
+     these placeholders are filled in per video: `{video_url}`, `{video_title}`,
      `{video_description}`, `{video_id}`, `{channel_name}`, `{channel_url}`,
-     `{published_at}`, `{fetched_at}`. Anything else is sent as written, so
-     `"type": "resource"` is always `resource`. In `tags`, commas inside
-     substituted values are replaced with spaces so they don't split a tag.
-     Use `{{` and `}}` for literal braces.
+     `{channel_country}`, `{published_at}`, `{fetched_at}`. Everything else in the
+     text is sent as written (use `{{` and `}}` for literal braces). **true/false,
+     numbers and objects** are sent exactly as you write them, e.g.
+     `"publish": true`.
    - `description_max_chars` - the `description` value is cut to this length
    - `timeout_seconds` - per-request timeout
+
+   Fields of `/events` that are **not** sent unless you add them to `payload`:
+   `source_id`, `role`, `file_url`, `event_type`, `event_start`, `event_end`,
+   `city`, `user`, `publish`, `process`. `publish` and `process` are left out on
+   purpose, so the API's own defaults apply.
 2. Set the secrets as environment variables (they never go in a file):
    ```
    setx UPLOAD_API_USERNAME "your_username"
@@ -90,20 +105,34 @@ like this (the API replies `202 Accepted`):
 
 URLs must be `https://` (plain `http://` is only allowed for `localhost`).
 
+**Checking that it works**
+
+- Every run ends with a summary line that says what the upload did, for example
+  `uploaded 8 video(s) (2 from earlier runs)`, `nothing to upload`, or
+  `upload FAILED (queued for retry)`. A successful login is logged as
+  `Logged in to <host>`. The summary says nothing about uploads when they are off.
+- To test the connection without scraping or sending anything, run
+  `python yt_tracker.py --check-upload`. It logs in and reports whether that worked.
+  It checks the login only; it can't check that the `/events` address exists
+  without creating a record.
+
 **When something goes wrong**
 - **The API can't take it right now** (server error, no network, 403, 404, 429,
-  or a login that fails): the events that did not go through are kept in
+  or a login that fails): the videos that did not go through are kept in
   `pending_upload.json` and sent first on the next run.
-- **The API refuses one event** (400, 409, 413 or 422 - bad data, or it already
-  has it): that event is logged, saved in `rejected_uploads.json` with the
-  reason, and skipped, so it can't block the others. If 5 events in a row are
-  refused, the script stops and keeps them queued, because that points to wrong
-  `event` settings rather than bad data.
+- **The API refuses one video** (400, 409, 413 or 422 - bad data, or it already
+  has that URL): it is logged, saved in `rejected_uploads.json` with the reason,
+  and skipped, so it can't block the others. If 5 in a row are refused, the
+  script stops and keeps them queued, because that points to wrong `payload`
+  settings rather than bad data.
 - The CSV and `state.json` are always updated before the upload. A failed upload
   makes the script exit with code 1 so Task Scheduler shows it.
 - Sending is one request per video, so a big backfill takes a while.
+- Channels saved in `channel_cache.json` by an older version are looked up once
+  more so their country is known (1 API unit each, 100 for `/c/` URLs).
 - A request can succeed even when its response is lost, so a video may rarely be
-  sent twice. The API should treat `url` as unique.
+  sent twice. `check_duplicate` asks the API to catch that; the API should treat
+  `url` as unique.
 
 ## Design
 
@@ -118,7 +147,7 @@ interface, favor composition, one responsibility per class.
 | `VideoPlatform` (`YouTubePlatform`, `CachedPlatform`) | Find channels, list videos; the cache wraps the platform |
 | `LookupStrategy` (`ById`, `ByHandle`, `ByUsername`, `ByCustomUrl`) | One class per YouTube URL style |
 | `VideoStore` (`CsvVideoStore`) | Where results are saved |
-| `VideoPublisher` (`EventApiPublisher`, `RetryingPublisher`, `NullPublisher`) | Sending new videos to another API; the retrying wrapper queues failures |
+| `VideoPublisher` (`ApiPublisher`, `RetryingPublisher`, `NullPublisher`) | Sending new videos to another API; the retrying wrapper queues failures |
 | `AccessTokenProvider` (`PasswordGrantTokenProvider`) | Gets and caches OAuth tokens |
 | `ScrapeHistory` | Which channels were scraped, and when |
 | `Settings` | Contents of `config.json` |
