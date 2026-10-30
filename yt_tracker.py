@@ -22,6 +22,8 @@ Design (in the spirit of Head First OOA&D):
                                                                   RetryingPublisher (decorator)
                                                                   NullPublisher (uploads off)
     AccessTokenProvider  interface: OAuth tokens                -> PasswordGrantTokenProvider
+    ResourceReader    interface: read resources back            -> ApiResourceReader
+    ResourceChecker   --check-resources: did the videos arrive?
     ScrapeHistory     remembers which channels were scraped, and when
     LookupStrategy    encapsulates what varies between channel URL styles
     Settings          the contents of config.json
@@ -39,15 +41,16 @@ import re
 import string
 import sys
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
@@ -77,7 +80,7 @@ class ChannelSourceError(Exception):
 
 
 class PublishError(Exception):
-    """An upload failed. `delivered` is how many records went through before it did."""
+    """A call to the upload API failed. `delivered` is how many records went through before it did."""
 
     def __init__(self, message: str, delivered: int = 0):
         super().__init__(message)
@@ -102,6 +105,7 @@ class Video:
     title: str
     published_at: str          # ISO 8601, as returned by YouTube
     description: str = ""      # not written to the CSV; available to the upload
+    tags: str = ""             # the uploader's own tags, comma separated; not written to the CSV
 
     @property
     def url(self) -> str:
@@ -203,7 +207,7 @@ def _positive_int(name: str, value) -> int:
 
 
 # Placeholders usable in the 'payload' templates of config.json.
-TEMPLATE_FIELDS = ROW_FIELDS + ["video_description", "channel_country"]
+TEMPLATE_FIELDS = ROW_FIELDS + ["video_description", "video_tags", "channel_country"]
 
 # The body posted to the API for each video. Text values are templates: {video_title} and
 # friends are filled in per video, and the rest of the text is sent as written. True/False,
@@ -215,7 +219,6 @@ DEFAULT_PAYLOAD = {
     "source": "{channel_name}",
     "title": "{video_title}",
     "description": "{video_description}",
-    "tags": "youtube",
     "image_url": "https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
     "country": "{channel_country}",
     "check_duplicate": True,
@@ -250,6 +253,16 @@ class UploadSettings:
     payload: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_PAYLOAD))
     description_max_chars: int = 500    # the "description" value is cut to this length
     timeout_seconds: int = 30
+    resources_url: str = ""             # where --check-resources reads from; worked out from api_url if empty
+
+    @property
+    def resources_endpoint(self) -> str:
+        """upload.resources_url, or api_url with /events swapped for /resources; "" if neither applies."""
+        if self.resources_url:
+            return self.resources_url
+        if self.api_url.endswith("/events"):
+            return self.api_url[: -len("/events")] + "/resources"
+        return ""
 
     @classmethod
     def from_dict(cls, raw) -> "UploadSettings":
@@ -271,6 +284,9 @@ class UploadSettings:
             raise ConfigError("upload.api_url and upload.token_url must both be set when upload.enabled is true.")
         _require_secure_url("api_url", api_url)
         _require_secure_url("token_url", token_url)
+        resources_url = str(raw.get("resources_url", "")).strip()
+        if resources_url:
+            _require_secure_url("resources_url", resources_url)
 
         client_auth = str(raw.get("client_auth", "basic")).strip().lower()
         if client_auth not in ("basic", "body"):
@@ -298,6 +314,7 @@ class UploadSettings:
             payload=dict(payload),
             description_max_chars=_positive_int("description_max_chars", raw.get("description_max_chars", 500)),
             timeout_seconds=_positive_int("timeout_seconds", raw.get("timeout_seconds", 30)),
+            resources_url=resources_url,
         )
 
 
@@ -556,6 +573,9 @@ class YouTubePlatform(VideoPlatform):
         return None
 
     def videos_since(self, channel: Channel, since: datetime) -> List[Video]:
+        return self.with_tags(self._published_since(channel, since))
+
+    def _published_since(self, channel: Channel, since: datetime) -> List[Video]:
         videos: List[Video] = []
         page_token = None
         while True:
@@ -582,6 +602,20 @@ class YouTubePlatform(VideoPlatform):
             page_token = response.get("nextPageToken")
             if not page_token:
                 return videos
+
+    def with_tags(self, videos: List[Video]) -> List[Video]:
+        """Add each video's own YouTube tags (videos.list: 1 unit per 50 videos)."""
+        tagged: Dict[str, str] = {}
+        for start in range(0, len(videos), 50):
+            ids = [v.video_id for v in videos[start:start + 50]]
+            try:
+                response = self._youtube.videos().list(part="snippet", id=",".join(ids)).execute()
+            except HttpError as e:
+                log.warning("Could not fetch video tags (%s); continuing without them.", e)
+                return videos
+            for item in response.get("items", []):
+                tagged[item["id"]] = ",".join(item["snippet"].get("tags", []))
+        return [replace(v, tags=tagged.get(v.video_id, "")) for v in videos]
 
 
 class CachedPlatform(VideoPlatform):
@@ -641,6 +675,14 @@ class VideoStore(ABC):
     def append(self, records: List[ScrapeRecord]) -> None:
         """Add records without touching the ones already there."""
 
+    def recent_videos(self, limit: int) -> List[Tuple[str, str]]:
+        """(video_id, video_url) of the most recently saved videos, newest first."""
+        return []
+
+    def all_records(self) -> List[ScrapeRecord]:
+        """Every saved video, oldest first. Only what the store keeps: no description or country."""
+        return []
+
 
 class CsvVideoStore(VideoStore):
     FIELDNAMES = ROW_FIELDS
@@ -665,6 +707,22 @@ class CsvVideoStore(VideoStore):
             if is_new_file:
                 writer.writeheader()
             writer.writerows(r.to_row() for r in records)
+
+    def recent_videos(self, limit: int) -> List[Tuple[str, str]]:
+        if not self._path.exists():
+            return []
+        with open(self._path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        return [(row["video_id"], row["video_url"]) for row in reversed(rows[-limit:])]
+
+    def all_records(self) -> List[ScrapeRecord]:
+        if not self._path.exists():
+            return []
+        with open(self._path, newline="", encoding="utf-8-sig") as f:
+            return [ScrapeRecord(row["fetched_at"], row["channel_url"],
+                                 Channel("", row["channel_name"], "", ""),
+                                 Video(row["video_id"], row["video_title"], row["published_at"]))
+                    for row in csv.DictReader(f)]
 
 
 # =====================================================================
@@ -851,7 +909,7 @@ class ApiPublisher(VideoPublisher):
 
     def _body_for(self, record: ScrapeRecord) -> Dict[str, Any]:
         values = dict(record.to_row(), video_description=record.video.description,
-                      channel_country=record.channel.country)
+                      video_tags=record.video.tags, channel_country=record.channel.country)
         body: Dict[str, Any] = {}
         for key, template in self._payload.items():
             if not isinstance(template, str):
@@ -859,7 +917,7 @@ class ApiPublisher(VideoPublisher):
                 continue
             filled_from = values
             if key == "tags":   # tags are comma separated, so a comma inside a value would split it
-                filled_from = {k: v.replace(",", " ") for k, v in values.items()}
+                filled_from = {k: (v if k == "video_tags" else v.replace(",", " ")) for k, v in values.items()}
             text = template.format_map(filled_from)
             if key == "description":
                 text = text[:self._max_description]
@@ -870,6 +928,7 @@ class ApiPublisher(VideoPublisher):
     def _send(self, record: ScrapeRecord) -> Optional[str]:
         """None if the API accepted the video, or the reason if it refused this one."""
         body = self._body_for(record)
+        log.info("POST %s payload: %s", self._url, json.dumps(body, ensure_ascii=False))   # the token is never logged
         for attempt in (1, 2):
             token = self._tokens.get_token()
             try:
@@ -880,6 +939,7 @@ class ApiPublisher(VideoPublisher):
                 raise PublishError(f"Could not reach the API: {e}") from e
 
             status = response.status_code
+            log.info("  -> HTTP %s for %s", status, record.video.url)
             if status == 401 and attempt == 1:
                 self._tokens.invalidate()   # token expired early or was revoked: get a fresh one, once
                 continue
@@ -946,6 +1006,157 @@ class RetryingPublisher(VideoPublisher):
 
     def _save_pending(self, records: List[ScrapeRecord]) -> None:
         self._file.save([asdict(r) for r in records])
+
+
+# =====================================================================
+# Reading back: did the videos arrive? (python yt_tracker.py --check-resources)
+# =====================================================================
+
+RECENT_VIDEOS_TO_LOOK_FOR = 10   # the newest videos in new_videos.csv that the check looks for
+SAMPLE_SIZE = 5                  # resources listed from the first page, so you can see what is there
+LIST_KEYS = ("items", "results", "data", "resources", "records")
+
+
+class ResourceReader(ABC):
+    @abstractmethod
+    def fetch_page(self, page: int, limit: int, resource_type: Optional[str]) -> Any:
+        """The parsed JSON of one page (pages start at 1). Raise PublishError on failure."""
+
+
+class ApiResourceReader(ResourceReader):
+    """GETs one page of resources with a bearer token, refreshing the token once after a 401."""
+
+    def __init__(self, url: str, tokens: AccessTokenProvider, timeout: int = 30, session=None):
+        self._url = url
+        self._tokens = tokens
+        self._timeout = timeout
+        self._session = session or requests.Session()
+
+    def fetch_page(self, page: int, limit: int, resource_type: Optional[str]) -> Any:
+        params: Dict[str, Any] = {"limit": limit, "page": page}
+        if resource_type:
+            params["type"] = resource_type
+        for attempt in (1, 2):
+            token = self._tokens.get_token()
+            try:
+                response = self._session.get(
+                    self._url, params=params, timeout=self._timeout,
+                    headers={"Authorization": f"Bearer {token}"})
+            except requests.RequestException as e:
+                raise PublishError(f"Could not reach the API: {e}") from e
+            if response.status_code == 401 and attempt == 1:
+                self._tokens.invalidate()
+                continue
+            if not 200 <= response.status_code < 300:
+                raise PublishError(
+                    f"The API refused the read: HTTP {response.status_code} {_describe_error(response)}".strip())
+            try:
+                return response.json()
+            except ValueError as e:
+                raise PublishError("The API's reply was not JSON.") from e
+
+
+def extract_items(payload) -> Tuple[List[dict], Optional[int], bool]:
+    """
+    Find the list of resources in a reply, whatever the API calls it.
+    Returns (items, total the API reports or None, whether a list was found at all).
+    """
+    if isinstance(payload, list):
+        return [i for i in payload if isinstance(i, dict)], None, True
+    if not isinstance(payload, dict):
+        return [], None, False
+
+    total = next((payload[k] for k in ("total", "total_count", "count")
+                  if isinstance(payload.get(k), int) and not isinstance(payload.get(k), bool)), None)
+    for key in LIST_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [i for i in value if isinstance(i, dict)], total, True
+        if isinstance(value, dict):   # e.g. {"data": {"items": [...]}}
+            items, inner_total, found = extract_items(value)
+            if found:
+                return items, total if total is not None else inner_total, True
+    for value in payload.values():    # a name we don't know: take the first list of objects
+        if isinstance(value, list) and value and all(isinstance(i, dict) for i in value):
+            return value, total, True
+    return [], total, False
+
+
+@dataclass
+class ResourceCheckReport:
+    url: str
+    resource_type: Optional[str]
+    pages_read: int = 0
+    scanned: int = 0
+    total_reported: Optional[int] = None
+    sample: List[str] = field(default_factory=list)
+    looked_for: List[Tuple[str, str]] = field(default_factory=list)   # (video_id, video_url)
+    missing: List[Tuple[str, str]] = field(default_factory=list)
+    unreadable_reply: bool = False
+
+    def lines(self) -> List[str]:
+        kind = f"type={self.resource_type}" if self.resource_type else "all types"
+        head = f"Read {self.pages_read} page(s) from {self.url} ({kind}): {self.scanned} resource(s) scanned"
+        if self.total_reported is not None:
+            head += f", {self.total_reported} in total according to the API"
+        result = [head + "."]
+        if self.unreadable_reply:
+            result.append("The reply did not contain a list of resources I recognise, so nothing could be matched.")
+        if self.sample:
+            result.append("First resources returned:")
+            result.extend(f"  - {label}" for label in self.sample)
+        if not self.looked_for:
+            result.append("There are no videos in new_videos.csv to look for yet.")
+            return result
+        found = len(self.looked_for) - len(self.missing)
+        result.append(f"Of the {len(self.looked_for)} most recent videos in new_videos.csv, "
+                      f"{found} were found in the API and {len(self.missing)} were not.")
+        result.extend(f"  not found: {url}" for _, url in self.missing)
+        if self.missing:
+            result.append("A missing video may still be processing, may be further down than the pages scanned "
+                          "(try --pages), or may have been refused (see rejected_uploads.json).")
+        return result
+
+
+class ResourceChecker:
+    """Reads resources back from the API and looks for the videos we most recently saved."""
+
+    def __init__(self, reader: ResourceReader, store: VideoStore, url: str):
+        self._reader = reader
+        self._store = store
+        self._url = url
+
+    def run(self, resource_type: Optional[str], limit: int, max_pages: int) -> ResourceCheckReport:
+        looked_for = self._store.recent_videos(RECENT_VIDEOS_TO_LOOK_FOR)
+        report = ResourceCheckReport(url=self._url, resource_type=resource_type, looked_for=looked_for)
+        remaining = list(looked_for)
+
+        for page in range(1, max_pages + 1):
+            items, total, recognised = extract_items(self._reader.fetch_page(page, limit, resource_type))
+            report.pages_read += 1
+            if total is not None:
+                report.total_reported = total
+            if not recognised:
+                report.unreadable_reply = True
+                break
+            if not items:
+                break
+            report.scanned += len(items)
+            if page == 1:
+                report.sample = [self._label(item) for item in items[:SAMPLE_SIZE]]
+
+            text = json.dumps(items, ensure_ascii=False)
+            remaining = [(vid, url) for vid, url in remaining if vid not in text and url not in text]
+            if not looked_for or not remaining or len(items) < limit:
+                break   # nothing to look for, found everything, or that was the last page
+
+        report.missing = [] if report.unreadable_reply else remaining
+        return report
+
+    @staticmethod
+    def _label(item: dict) -> str:
+        title = str(item.get("title") or item.get("name") or "(no title)")[:80]
+        return f"{title} ({item['url']})" if item.get("url") else title
 
 
 # =====================================================================
@@ -1090,10 +1301,8 @@ class Tracker:
 # Composition root: the only place that knows which concrete classes are used
 # =====================================================================
 
-def build_publisher(upload: UploadSettings) -> VideoPublisher:
-    if not upload.enabled:
-        return NullPublisher()
-    tokens = PasswordGrantTokenProvider(
+def build_token_provider(upload: UploadSettings) -> PasswordGrantTokenProvider:
+    return PasswordGrantTokenProvider(
         token_url=upload.token_url,
         credentials=load_upload_credentials(),
         scope=upload.scope,
@@ -1101,8 +1310,29 @@ def build_publisher(upload: UploadSettings) -> VideoPublisher:
         send_grant_type=upload.include_grant_type,
         timeout=upload.timeout_seconds,
     )
-    publisher = ApiPublisher(upload, tokens, rejected_file=JsonFile(REJECTED_FILE))
+
+
+def build_publisher(upload: UploadSettings) -> VideoPublisher:
+    if not upload.enabled:
+        return NullPublisher()
+    publisher = ApiPublisher(upload, build_token_provider(upload), rejected_file=JsonFile(REJECTED_FILE))
     return RetryingPublisher(publisher, JsonFile(PENDING_FILE))
+
+
+def default_resource_type(upload: UploadSettings) -> Optional[str]:
+    """The 'type' the uploader sends, when it is plain text; used to filter --check-resources."""
+    value = upload.payload.get("type")
+    return value if isinstance(value, str) and "{" not in value else None
+
+
+def build_resource_checker(upload: UploadSettings) -> ResourceChecker:
+    if not upload.enabled:
+        raise ConfigError("Uploads are switched off (upload.enabled is not true in config.json).")
+    url = upload.resources_endpoint
+    if not url:
+        raise ConfigError("Set upload.resources_url in config.json: it can't be worked out from upload.api_url.")
+    reader = ApiResourceReader(url, build_token_provider(upload), timeout=upload.timeout_seconds)
+    return ResourceChecker(reader, CsvVideoStore(OUTPUT_CSV), url)
 
 
 def build_tracker(settings: Settings, api_key: str) -> Tracker:
@@ -1136,10 +1366,33 @@ def configure_logging() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # avoid Windows cp1252 crashes
 
 
+def _bounded_int(low: int, high: int):
+    def parse(text: str) -> int:
+        try:
+            number = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
+        return number
+    return parse
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Find new videos on the YouTube channels listed in a Google Sheet.")
-    parser.add_argument("--check-upload", action="store_true",
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument("--check-upload", action="store_true",
                         help="only test the login to the upload API, then exit; nothing is scraped or sent")
+    checks.add_argument("--check-resources", action="store_true",
+                        help="read resources back from the API and look for your most recent videos, then exit; "
+                             "nothing is scraped or sent")
+    parser.add_argument("--resource-type", metavar="TYPE",
+                        help='with --check-resources: only list resources of this type (default: the "type" the '
+                             'uploader sends; use "all" for every type)')
+    parser.add_argument("--limit", type=_bounded_int(1, 200), default=50,
+                        help="with --check-resources: resources per page (default 50)")
+    parser.add_argument("--pages", type=_bounded_int(1, 20), default=3,
+                        help="with --check-resources: how many pages to scan at most (default 3)")
     return parser.parse_args(argv)
 
 
@@ -1150,6 +1403,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         settings = Settings.from_file(CONFIG_FILE)
         if args.check_upload:
             log.info("%s", build_publisher(settings.upload).check_connection())
+            return 0
+        if args.check_resources:
+            checker = build_resource_checker(settings.upload)
+            if args.resource_type is None:
+                resource_type = default_resource_type(settings.upload)
+            else:
+                resource_type = None if args.resource_type.lower() == "all" else args.resource_type
+            for line in checker.run(resource_type, args.limit, args.pages).lines():
+                log.info("%s", line)
             return 0
         summary = build_tracker(settings, load_api_key()).run()
     except (ConfigError, ChannelSourceError) as e:

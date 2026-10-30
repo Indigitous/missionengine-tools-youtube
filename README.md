@@ -65,7 +65,6 @@ body like this:
  "source": "Channel name",
  "title": "Video title",
  "description": "The video's YouTube description (first 500 characters)",
- "tags": "youtube",
  "image_url": "https://i.ytimg.com/vi/<video id>/hqdefault.jpg",
  "country": "PH",
  "check_duplicate": true}
@@ -82,13 +81,18 @@ one send nothing for it. Any text value that comes out empty is left out.
    - `scope`, `client_auth` - only needed if the API asks for them
    - `payload` - the JSON sent for each video. **Text** values are templates;
      these placeholders are filled in per video: `{video_url}`, `{video_title}`,
-     `{video_description}`, `{video_id}`, `{channel_name}`, `{channel_url}`,
+     `{video_description}`, `{video_tags}`, `{video_id}`, `{channel_name}`, `{channel_url}`,
      `{channel_country}`, `{published_at}`, `{fetched_at}`. Everything else in the
      text is sent as written (use `{{` and `}}` for literal braces). **true/false,
      numbers and objects** are sent exactly as you write them, e.g.
      `"publish": true`.
    - `description_max_chars` - the `description` value is cut to this length
    - `timeout_seconds` - per-request timeout
+   - `resources_url` - where `--check-resources` reads from. If left out, it is `api_url` with `/events` replaced by `/resources`
+
+   `tags` is not sent by default, so the API applies its own default behaviour. To send the
+   tags the uploader gave the video on YouTube (a comma-separated list; costs 1 API unit
+   per 50 videos), add `"tags": "{video_tags}"` to `payload`.
 
    Fields of `/events` that are **not** sent unless you add them to `payload`:
    `source_id`, `role`, `file_url`, `event_type`, `event_start`, `event_end`,
@@ -111,10 +115,40 @@ URLs must be `https://` (plain `http://` is only allowed for `localhost`).
   `uploaded 8 video(s) (2 from earlier runs)`, `nothing to upload`, or
   `upload FAILED (queued for retry)`. A successful login is logged as
   `Logged in to <host>`. The summary says nothing about uploads when they are off.
+- Each video's request is logged: `POST <url> payload: {...}` with the exact JSON sent
+  to `/events`, then `-> HTTP <status>`. The access token and password are never logged.
 - To test the connection without scraping or sending anything, run
   `python yt_tracker.py --check-upload`. It logs in and reports whether that worked.
   It checks the login only; it can't check that the `/events` address exists
   without creating a record.
+
+- To confirm the videos arrived, run `python yt_tracker.py --check-resources`. It
+  reads resources back from the API (`GET /resources`, using the same login) and
+  looks for the 10 most recent videos in `new_videos.csv`. It lists the first few
+  resources it got, and says which of your videos were found and which were not.
+  Options: `--resource-type TYPE` (default: the `type` your uploader sends, i.e.
+  `resource`; use `all` for every type), `--limit N` (per page, default 50) and
+  `--pages N` (how many pages to scan, default 3). A video that isn't found may
+  still be processing, may be further down than the pages scanned, or may have
+  been refused (see `rejected_uploads.json`).
+
+**Uploading the CSV on demand**
+
+`upload_csv.py` (next to `yt_tracker.py`) sends every video in `new_videos.csv`
+without scraping anything:
+
+```
+python upload_csv.py             # send them all, plus anything in pending_upload.json
+python upload_csv.py --dry-run   # only count what would be sent
+```
+
+It uses the same `upload` settings and `UPLOAD_API_*` environment variables, and
+stops with an error if `upload.enabled` is not `true`. Failures stay queued in
+`pending_upload.json`, refused videos go to `rejected_uploads.json`, and the exit
+code is 1 if the upload fails. Videos already waiting in `pending_upload.json` are
+not sent twice. Sending a video that already arrived is harmless: the API refuses
+the duplicate (`check_duplicate`) and it is skipped. The CSV has no description or
+channel country, so those two fields are left out.
 
 **When something goes wrong**
 - **The API can't take it right now** (server error, no network, 403, 404, 429,
@@ -149,6 +183,8 @@ interface, favor composition, one responsibility per class.
 | `VideoStore` (`CsvVideoStore`) | Where results are saved |
 | `VideoPublisher` (`ApiPublisher`, `RetryingPublisher`, `NullPublisher`) | Sending new videos to another API; the retrying wrapper queues failures |
 | `AccessTokenProvider` (`PasswordGrantTokenProvider`) | Gets and caches OAuth tokens |
+| `ResourceReader` (`ApiResourceReader`), `ResourceChecker` | `--check-resources`: reads resources back and looks for your videos |
+| `CsvUploader` (in `upload_csv.py`) | Sends the saved videos through a `VideoPublisher`, on demand |
 | `ScrapeHistory` | Which channels were scraped, and when |
 | `Settings` | Contents of `config.json` |
 
