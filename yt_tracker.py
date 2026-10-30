@@ -215,7 +215,7 @@ TEMPLATE_FIELDS = ROW_FIELDS + ["video_description", "video_tags", "channel_coun
 # channel with no country) is left out of the request.
 DEFAULT_PAYLOAD = {
     "url": "{video_url}",
-    "type": "resource",
+    "type": "video",
     "source": "{channel_name}",
     "title": "{video_title}",
     "description": "{video_description}",

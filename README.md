@@ -61,7 +61,7 @@ body like this:
 
 ```json
 {"url": "https://www.youtube.com/watch?v=...",
- "type": "resource",
+ "type": "video",
  "source": "Channel name",
  "title": "Video title",
  "description": "The video's YouTube description (first 500 characters)",
@@ -71,7 +71,8 @@ body like this:
 ```
 
 `country` is the country YouTube lists for the channel; channels that haven't set
-one send nothing for it. Any text value that comes out empty is left out.
+one send no `country` at all, so the API works the country out itself. Any other text value
+that comes out empty is left out too.
 
 1. Fill in the `upload` block of `config.json` (see `config.example.json`):
    - `api_url` / `token_url` - the `/events` endpoint and the token endpoint
@@ -127,7 +128,7 @@ URLs must be `https://` (plain `http://` is only allowed for `localhost`).
   looks for the 10 most recent videos in `new_videos.csv`. It lists the first few
   resources it got, and says which of your videos were found and which were not.
   Options: `--resource-type TYPE` (default: the `type` your uploader sends, i.e.
-  `resource`; use `all` for every type), `--limit N` (per page, default 50) and
+  `video`; use `all` for every type), `--limit N` (per page, default 50) and
   `--pages N` (how many pages to scan, default 3). A video that isn't found may
   still be processing, may be further down than the pages scanned, or may have
   been refused (see `rejected_uploads.json`).
