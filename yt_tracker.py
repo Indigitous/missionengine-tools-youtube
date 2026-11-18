@@ -1,9 +1,11 @@
 """
 YouTube new-video tracker.
 
-Reads channel URLs from a PRIVATE Google Sheet, finds videos published since each
-channel was last scraped, and appends them to a local CSV. Designed to run weekly
-from Windows Task Scheduler.
+Each run:
+  1. (optional) adds new YouTube links from Airtable's Content Sources table to the Google Sheet;
+  2. reads channel URLs from the PRIVATE Google Sheet, finds videos published since each
+     channel was last scraped, and appends them to a local CSV (and uploads them, if set up).
+Designed to run weekly from Windows Task Scheduler.
 
 Requirements:
     pip install -r requirements.txt
@@ -26,6 +28,8 @@ Design (in the spirit of Head First OOA&D):
     ResourceChecker   --check-resources: did the videos arrive?
     ScrapeHistory     remembers which channels were scraped, and when
     LookupStrategy    encapsulates what varies between channel URL styles
+    AirtableLinkReader     reads YouTube links from Airtable (never scraped directly)
+    GoogleSheetLinkCopier  adds links missing from the Sheet as new rows
     Settings          the contents of config.json
 
     Swap Sheets for a CSV, or CSV for a database, by writing one new class that
@@ -40,6 +44,7 @@ import os
 import re
 import string
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -93,10 +98,12 @@ class PublishError(Exception):
 
 @dataclass(frozen=True)
 class Channel:
-    channel_id: str
+    """A source of videos. Usually a channel; a playlist or single-video link works too (see kind)."""
+    channel_id: str            # the key in state.json: channel ID, playlist ID, or "video:<id>"
     name: str
-    uploads_playlist: str
+    uploads_playlist: str      # playlist to list; for kind "video", the video's ID
     country: str = ""          # ISO country code YouTube lists for the channel, if it set one
+    kind: str = "channel"      # "channel", "playlist" (one playlist only) or "video" (one video only)
 
 
 @dataclass(frozen=True)
@@ -319,13 +326,47 @@ class UploadSettings:
 
 
 @dataclass(frozen=True)
+class AirtableSettings:
+    """
+    The optional 'airtable' block of config.json. When set, each run first adds Airtable's
+    YouTube links that are missing from the Google Sheet to it. Scraping still reads the Sheet only.
+    """
+    base_id: str
+    table: str
+    url_field: str = "URL"
+    view: str = ""   # optional: only read records shown in this view
+    attribution_field: str = "Short Description"   # copied into the Sheet's "attribution" column
+
+    @classmethod
+    def from_dict(cls, raw) -> Optional["AirtableSettings"]:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ConfigError("'airtable' in config.json must be an object.")
+        if raw.get("enabled", True) is False:
+            return None
+        base_id = str(raw.get("base_id", "")).strip()
+        table = str(raw.get("table", "")).strip()
+        if not re.fullmatch(r"app[A-Za-z0-9]{14}", base_id):
+            raise ConfigError("airtable.base_id must be your base's ID (starts with 'app', 17 characters).")
+        if not table:
+            raise ConfigError("airtable.table must be set (the table name, e.g. \"Content Sources\", or its tbl... ID).")
+        url_field = str(raw.get("url_field", cls.url_field)).strip()
+        if not url_field:
+            raise ConfigError("airtable.url_field must be the name of the field that holds the links.")
+        return cls(base_id=base_id, table=table, url_field=url_field, view=str(raw.get("view", "")).strip(),
+                   attribution_field=str(raw.get("attribution_field", cls.attribution_field)).strip())
+
+
+@dataclass(frozen=True)
 class Settings:
-    sheet_id: str
+    sheet_id: str = ""
     sheet_tab: str = "Sheet1"
     url_column_header: str = "channel_url"
     service_account_file: str = "service_account.json"
     new_channel_lookback_days: Optional[int] = 7   # None means "all": every video, from the beginning
     upload: UploadSettings = field(default_factory=UploadSettings)
+    airtable: Optional[AirtableSettings] = None   # set = copy new Airtable links into the Sheet each run
 
     @property
     def new_channel_lookback(self) -> Optional[timedelta]:
@@ -358,6 +399,7 @@ class Settings:
         sheet_id = str(cfg.get("sheet_id", "")).strip()
         if not sheet_id or sheet_id.startswith("PASTE_"):
             raise ConfigError("Set 'sheet_id' in config.json to your Google Sheet's ID.")
+        airtable = AirtableSettings.from_dict(cfg.get("airtable"))
 
         # "first_run_lookback_days" is the older name for the same setting.
         lookback = cfg.get("new_channel_lookback_days", cfg.get("first_run_lookback_days", 7))
@@ -368,7 +410,16 @@ class Settings:
             service_account_file=cfg.get("service_account_file", cls.service_account_file),
             new_channel_lookback_days=cls._parse_lookback(lookback),
             upload=UploadSettings.from_dict(cfg.get("upload")),
+            airtable=airtable,
         )
+
+
+def load_airtable_token() -> str:
+    token = os.environ.get("AIRTABLE_TOKEN")
+    if not token:
+        raise ConfigError("The 'airtable' block is set, so the AIRTABLE_TOKEN environment variable must be set "
+                          "(an Airtable personal access token with data.records:read on that base).")
+    return token
 
 
 def load_api_key() -> str:
@@ -481,6 +532,164 @@ class GoogleSheetChannelSource(ChannelSource):
         return urls
 
 
+YOUTUBE_URL = re.compile(r"(?:^|[/.])(?:youtube\.com|youtu\.be)(?:/|$)", re.IGNORECASE)
+
+
+class AirtableLinkReader:
+    """
+    Reads links from one field of an Airtable table and keeps only the YouTube ones.
+    It is not a ChannelSource: nothing is scraped from Airtable. The links are copied
+    into the Google Sheet (GoogleSheetLinkCopier), and the Sheet is what gets scraped.
+    """
+    API = "https://api.airtable.com/v0"
+
+    def __init__(self, settings: AirtableSettings, token: str, timeout: int = 30, session=None):
+        self._settings = settings
+        self._token = token
+        self._timeout = timeout
+        self._session = session or requests.Session()
+
+    def youtube_links(self) -> List[Tuple[str, str]]:
+        """(url, attribution) for each YouTube link, de-duplicated, in table order."""
+        try:
+            records = self._read_records()
+        except ChannelSourceError:
+            raise
+        except Exception as e:
+            raise ChannelSourceError(f"Could not read Airtable: {e}") from e
+
+        links, seen, skipped = [], set(), 0
+        for record in records:
+            fields = record.get("fields", {})
+            attribution = fields.get(self._settings.attribution_field) if self._settings.attribution_field else ""
+            attribution = attribution.strip() if isinstance(attribution, str) else ""
+            for url in self._links_in(fields.get(self._settings.url_field)):
+                if not YOUTUBE_URL.search(url):
+                    skipped += 1
+                    continue
+                if url not in seen:
+                    seen.add(url)
+                    links.append((url, attribution))
+        log.info("Airtable: %d record(s), %d YouTube link(s), %d other link(s) skipped",
+                 len(records), len(links), skipped)
+        return links
+
+    @staticmethod
+    def _links_in(value) -> List[str]:
+        """A field can be a URL/text field (one string) or a lookup/rollup (a list)."""
+        if value is None:
+            return []
+        values = value if isinstance(value, list) else [value]
+        return [str(v).strip() for v in values if isinstance(v, str) and v.strip()]
+
+    def _read_records(self) -> List[dict]:
+        s = self._settings
+        endpoint = f"{self.API}/{s.base_id}/{requests.utils.quote(s.table, safe='')}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        params: Dict[str, Any] = {"pageSize": 100,
+                                  "fields[]": [f for f in (s.url_field, s.attribution_field) if f]}
+        if s.view:
+            params["view"] = s.view
+
+        records: List[dict] = []
+        while True:
+            response = self._session.get(endpoint, headers=headers, params=params, timeout=self._timeout)
+            if response.status_code != 200:
+                raise ChannelSourceError(
+                    f"Airtable returned HTTP {response.status_code} for table '{s.table}': "
+                    f"{_describe_error(response)}")
+            data = response.json()
+            records.extend(data.get("records", []))
+            offset = data.get("offset")
+            if not offset:
+                return records
+            params["offset"] = offset
+            time.sleep(0.2)   # Airtable allows 5 requests per second per base
+
+
+def comparable_url(url: str) -> str:
+    """So https://www.youtube.com/@Foo/ and youtube.com/@foo count as the same link."""
+    url = url.strip().lower()
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^(?:www\.|m\.)", "", url)
+    return url.rstrip("/")
+
+
+def channel_name_from_url(url: str) -> str:
+    """A short name like the Sheet's existing ones: the handle, username or ID in the link."""
+    match = re.search(r"[?&](?:list|v)=([\w-]+)", url)
+    if match:
+        return match.group(1)
+    path = [part for part in urlparse(url if "://" in url else "https://" + url).path.split("/") if part]
+    return path[-1].lstrip("@") if path else url
+
+
+class GoogleSheetLinkCopier:
+    """Adds links that aren't in the Google Sheet yet as new rows. Never changes or removes a row."""
+
+    def __init__(self, sheet_id: str, tab: str, url_column_header: str, credentials_file: Path, sheets=None):
+        self._sheet_id = sheet_id
+        self._tab = tab
+        self._header = url_column_header
+        self._credentials_file = credentials_file
+        self._sheets_api = sheets
+
+    def copy(self, links: List[Tuple[str, str]], dry_run: bool = False) -> List[str]:
+        """Returns the URLs that were (or, with dry_run, would be) added."""
+        sheets = self._sheets()
+        rows = sheets.values().get(spreadsheetId=self._sheet_id, range=f"'{self._tab}'").execute().get("values", [])
+        if not rows:
+            raise ChannelSourceError(f"Tab '{self._tab}' is empty; it needs a header row first.")
+        header = [h.strip().lower() for h in rows[0]]
+        if self._header.lower() not in header:
+            raise ChannelSourceError(f"Column '{self._header}' not found. Headers seen: {rows[0]}")
+        col = header.index(self._header.lower())
+
+        existing = {comparable_url(row[col]) for row in rows[1:] if len(row) > col and row[col].strip()}
+        new_rows, added = [], []
+        for url, attribution in links:
+            key = comparable_url(url)
+            if key in existing:
+                continue
+            existing.add(key)
+            values = {self._header.lower(): url, "channel_name": channel_name_from_url(url),
+                      "attribution": attribution, "is_processed": "0"}
+            new_rows.append([values.get(h, "") for h in header])
+            added.append(url)
+
+        if new_rows and not dry_run:
+            sheets.values().append(
+                spreadsheetId=self._sheet_id, range=f"'{self._tab}'",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                body={"values": new_rows},
+            ).execute()
+        return added
+
+    def _sheets(self):
+        if self._sheets_api is None:
+            creds = service_account.Credentials.from_service_account_file(
+                str(self._credentials_file), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+            self._sheets_api = build("sheets", "v4", credentials=creds, cache_discovery=False).spreadsheets()
+        return self._sheets_api
+
+
+def copy_airtable_to_sheet(settings: "Settings", dry_run: bool = False) -> List[str]:
+    links = AirtableLinkReader(settings.airtable, load_airtable_token()).youtube_links()
+    copier = GoogleSheetLinkCopier(settings.sheet_id, settings.sheet_tab, settings.url_column_header,
+                                   service_account_path(settings))
+    try:
+        added = copier.copy(links, dry_run=dry_run)
+    except HttpError as e:
+        if e.resp.status == 403:
+            raise ChannelSourceError(
+                "Google Sheets refused the write (HTTP 403). Share the Sheet with the service account "
+                "as Editor (not Viewer).") from e
+        raise ChannelSourceError(f"Could not write to the Google Sheet: {e}") from e
+    log.info("%s %d new link(s) to the Google Sheet (%d were already there)",
+             "Would add" if dry_run else "Added", len(added), len(links) - len(added))
+    return added
+
+
 # =====================================================================
 # Interface 2: how do we find channels and their videos?
 # =====================================================================
@@ -532,6 +741,21 @@ class ByUsername(LookupStrategy):
         return {"forUsername": value}
 
 
+class ByLegacyName(LookupStrategy):
+    """Old links with just a name, like youtube.com/GCFMain. Could be a username, a handle or a custom URL."""
+    pattern = (r"youtube\.com/(?!(?:watch|playlist|channel|user|c|shorts|live|embed|results|feed)(?:[/?#]|$))"
+               r"([\w.-]+)/?(?:[?#].*)?$")
+
+    def params(self, youtube, value):
+        # Handle first: today youtube.com/NAME usually points to the channel with that handle,
+        # and an old username with the same name can belong to someone else.
+        for key in ("forHandle", "forUsername"):
+            items = youtube.channels().list(part="id", **{key: value}).execute().get("items", [])
+            if items:
+                return {"id": items[0]["id"]}
+        return ByCustomUrl().params(youtube, value)   # last resort: search (100 units, cached)
+
+
 class ByCustomUrl(LookupStrategy):
     pattern = r"youtube\.com/c/([\w-]+)"
 
@@ -549,9 +773,18 @@ class YouTubePlatform(VideoPlatform):
 
     def __init__(self, api_key: str, strategies: Optional[List[LookupStrategy]] = None):
         self._youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
-        self._strategies = strategies or [ById(), ByHandle(), ByUsername(), ByCustomUrl()]
+        self._strategies = strategies or [ById(), ByHandle(), ByUsername(), ByCustomUrl(), ByLegacyName()]
+
+    VIDEO_LINK = re.compile(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/))([\w-]{11})")
+    PLAYLIST_LINK = re.compile(r"youtube\.com/playlist\?(?:.*&)?list=([\w-]+)")
 
     def find_channel(self, url: str) -> Optional[Channel]:
+        video = self.VIDEO_LINK.search(url)
+        if video:
+            return self._video_source(video.group(1))
+        playlist = self.PLAYLIST_LINK.search(url)
+        if playlist:
+            return self._playlist_source(playlist.group(1))
         for strategy in self._strategies:
             value = strategy.extract(url)
             if value is None:
@@ -572,10 +805,56 @@ class YouTubePlatform(VideoPlatform):
             )
         return None
 
+    def _country_of(self, channel_id: str) -> str:
+        items = self._youtube.channels().list(part="snippet", id=channel_id).execute().get("items", [])
+        return items[0]["snippet"].get("country", "") if items else ""
+
+    def _playlist_source(self, playlist_id: str) -> Optional[Channel]:
+        items = self._youtube.playlists().list(part="snippet", id=playlist_id).execute().get("items", [])
+        if not items:
+            return None
+        snippet = items[0]["snippet"]
+        return Channel(
+            channel_id=playlist_id,
+            name=snippet.get("channelTitle") or snippet["title"],
+            uploads_playlist=playlist_id,
+            country=self._country_of(snippet["channelId"]),
+            kind="playlist",
+        )
+
+    def _video_source(self, video_id: str) -> Optional[Channel]:
+        items = self._youtube.videos().list(part="snippet", id=video_id).execute().get("items", [])
+        if not items:
+            return None
+        snippet = items[0]["snippet"]
+        return Channel(
+            channel_id=f"video:{video_id}",
+            name=snippet["channelTitle"],
+            uploads_playlist=video_id,
+            country=self._country_of(snippet["channelId"]),
+            kind="video",
+        )
+
     def videos_since(self, channel: Channel, since: datetime) -> List[Video]:
+        if channel.kind == "video":
+            # Someone added this one video on purpose, so it is sent however old it is.
+            # The CSV's known video IDs stop it from being sent twice.
+            return self.with_tags(self._single_video(channel.uploads_playlist))
         return self.with_tags(self._published_since(channel, since))
 
+    def _single_video(self, video_id: str) -> List[Video]:
+        items = self._youtube.videos().list(part="snippet", id=video_id).execute().get("items", [])
+        return [Video(
+            video_id=item["id"],
+            title=item["snippet"]["title"],
+            published_at=item["snippet"]["publishedAt"],
+            description=item["snippet"].get("description", ""),
+        ) for item in items]
+
     def _published_since(self, channel: Channel, since: datetime) -> List[Video]:
+        # A channel's uploads list is newest first, so we can stop at the first old video.
+        # A playlist can be in any order, so all of it is read.
+        newest_first = channel.kind == "channel"
         videos: List[Video] = []
         page_token = None
         while True:
@@ -591,7 +870,9 @@ class YouTubePlatform(VideoPlatform):
                 if not published:
                     continue   # private or deleted video
                 if parse_ts(published) <= since:
-                    return videos   # newest-first, so everything after this is older
+                    if newest_first:
+                        return videos   # everything after this is older
+                    continue
                 videos.append(Video(
                     video_id=item["contentDetails"]["videoId"],
                     title=item["snippet"]["title"],
@@ -1335,10 +1616,13 @@ def build_resource_checker(upload: UploadSettings) -> ResourceChecker:
     return ResourceChecker(reader, CsvVideoStore(OUTPUT_CSV), url)
 
 
-def build_tracker(settings: Settings, api_key: str) -> Tracker:
+def service_account_path(settings: Settings) -> Path:
     key_file = Path(settings.service_account_file)
-    if not key_file.is_absolute():
-        key_file = BASE_DIR / key_file
+    return key_file if key_file.is_absolute() else BASE_DIR / key_file
+
+
+def build_tracker(settings: Settings, api_key: str) -> Tracker:
+    key_file = service_account_path(settings)
 
     platform = CachedPlatform(YouTubePlatform(api_key), JsonFile(CACHE_FILE))
     history = ScrapeHistory(JsonFile(STATE_FILE))
@@ -1379,13 +1663,20 @@ def _bounded_int(low: int, high: int):
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Find new videos on the YouTube channels listed in a Google Sheet.")
+    parser = argparse.ArgumentParser(description="Find new videos on the YouTube channels listed in a Google Sheet "
+                                                 "(after adding new YouTube links from Airtable to it, if set up).")
     checks = parser.add_mutually_exclusive_group()
     checks.add_argument("--check-upload", action="store_true",
                         help="only test the login to the upload API, then exit; nothing is scraped or sent")
+    checks.add_argument("--check-airtable", action="store_true",
+                        help="only list the YouTube links found in Airtable, then exit; nothing is scraped or sent")
+    checks.add_argument("--copy-to-sheet", action="store_true",
+                        help="only add Airtable's YouTube links that are missing from the Google Sheet, then exit")
     checks.add_argument("--check-resources", action="store_true",
                         help="read resources back from the API and look for your most recent videos, then exit; "
                              "nothing is scraped or sent")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --copy-to-sheet: only list what would be added; the Sheet is not changed")
     parser.add_argument("--resource-type", metavar="TYPE",
                         help='with --check-resources: only list resources of this type (default: the "type" the '
                              'uploader sends; use "all" for every type)')
@@ -1404,6 +1695,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.check_upload:
             log.info("%s", build_publisher(settings.upload).check_connection())
             return 0
+        if args.check_airtable:
+            if settings.airtable is None:
+                raise ConfigError("There is no 'airtable' block in config.json.")
+            for url, _ in AirtableLinkReader(settings.airtable, load_airtable_token()).youtube_links():
+                log.info("  %s", url)
+            return 0
+        if args.copy_to_sheet:
+            if settings.airtable is None:
+                raise ConfigError("--copy-to-sheet needs the 'airtable' block in config.json.")
+            for url in copy_airtable_to_sheet(settings, dry_run=args.dry_run):
+                log.info("  %s", url)
+            return 0
         if args.check_resources:
             checker = build_resource_checker(settings.upload)
             if args.resource_type is None:
@@ -1413,6 +1716,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             for line in checker.run(resource_type, args.limit, args.pages).lines():
                 log.info("%s", line)
             return 0
+        if settings.airtable is not None:
+            # Step 1: add new Airtable links to the Sheet, so step 2 scrapes them this same run.
+            try:
+                copy_airtable_to_sheet(settings)
+            except Exception as e:   # never let Airtable stop the weekly scrape
+                log.error("Copying Airtable links to the Google Sheet failed (scraping goes ahead): %s", e)
+        # Step 2: scrape every channel in the Google Sheet.
         summary = build_tracker(settings, load_api_key()).run()
     except (ConfigError, ChannelSourceError) as e:
         log.error("%s", e)

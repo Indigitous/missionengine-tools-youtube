@@ -1,4 +1,11 @@
 {
+  "airtable": {
+    "base_id": "appPASTE_BASE_ID_",
+    "table": "Content Sources",
+    "url_field": "URL",
+    "view": "",
+    "attribution_field": "Short Description"
+  },
   "sheet_id": "PASTE_YOUR_SPREADSHEET_ID_HERE",
   "sheet_tab": "Sheet1",
   "url_column_header": "channel_url",
