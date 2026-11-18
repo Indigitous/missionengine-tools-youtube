@@ -1,7 +1,9 @@
 # YouTube New-Video Tracker
 
 Reads a list of YouTube channel URLs from a private Google Sheet, finds videos
-published since the last successful run, and appends them to a local CSV.
+published since the last successful run, and appends them to a local CSV (and can
+upload them to MissionEngine). Before scraping, it can add new YouTube links from
+Airtable's Content Sources table to the Sheet.
 Intended to run weekly via Windows Task Scheduler.
 
 ## Setup
@@ -31,6 +33,67 @@ Intended to run weekly via Windows Task Scheduler.
    pip install -r requirements.txt
    python yt_tracker.py
    ```
+
+## Adding new channels from Airtable (Content Sources)
+
+The Google Sheet is the only list that gets scraped. If `config.json` has an
+`airtable` block, each run does two steps:
+
+1. **Airtable to Sheet.** Read the Content Sources table, keep only links to
+   `youtube.com` or `youtu.be`, and add any that are missing from the Sheet as new
+   rows at the bottom. Existing rows are never changed or removed. A link counts as
+   already there even if it is written a bit differently (`http`/`https`, `www.`,
+   capitals, a trailing `/`).
+2. **Scrape the Sheet.** Check every channel in the Sheet for new videos, as
+   before. Links added in step 1 are new channels, so they get
+   `new_channel_lookback_days` of videos in this same run.
+
+If step 1 fails (Airtable down, missing token, no write access), the error is
+logged and step 2 still runs.
+
+Each new row gets:
+- `channel_url` - the link
+- `channel_name` - the handle, username or ID taken from the link
+- `attribution` - the Airtable field named in `attribution_field`
+  (default `Short Description`), if it has a value
+- `is_processed` - `0`
+
+Other columns are left blank.
+
+**Setup**
+
+1. Create an Airtable personal access token at https://airtable.com/create/tokens
+   with the `data.records:read` scope and access to the base, then set it:
+   ```
+   setx AIRTABLE_TOKEN "your_token"
+   ```
+2. Share the Google Sheet with the service account's `client_email` as **Editor**
+   (Viewer is only enough for reading).
+3. Fill in the `airtable` block of `config.json`:
+   - `base_id` - the `app...` part of the base's URL
+   - `table` - the table name (`Content Sources`) or its `tbl...` ID
+   - `url_field` - the field holding the link (a URL, text or lookup field)
+   - `attribution_field` - the field copied into `attribution` (`""` for none)
+   - `view` - optional; only read records shown in this view
+   - `enabled` - optional; `false` turns step 1 off without deleting the block
+4. Check it:
+   ```
+   python yt_tracker.py --check-airtable           # list the YouTube links in Airtable
+   python yt_tracker.py --copy-to-sheet --dry-run  # list what would be added to the Sheet
+   python yt_tracker.py --copy-to-sheet            # do step 1 only, no scraping
+   ```
+
+**What each kind of link in the Sheet does**
+- **Channel** (`/@handle`, `/channel/...`, `/user/...`, `/c/...`, or old-style
+  `youtube.com/NAME`): new uploads from that channel. For `youtube.com/NAME` the
+  handle is tried first, then the old username, then a search (100 units, done once).
+- **Playlist** (`/playlist?list=...`): new videos in that playlist only. The whole
+  playlist is read each run, since playlists aren't always newest first.
+- **Single video** (`watch?v=`, `youtu.be/`, `/shorts/`, `/live/`): that one video is
+  sent once, however old it is.
+
+A link that can't be found on YouTube is logged as "Could not resolve channel" and
+tried again next run.
 
 ## Scheduling (Windows)
 
@@ -179,8 +242,9 @@ interface, favor composition, one responsibility per class.
 | --- | --- |
 | `Tracker` | Runs one scrape. Knows nothing about Google, CSV or JSON. |
 | `ChannelSource` (`GoogleSheetChannelSource`) | Where channel URLs come from |
+| `AirtableLinkReader`, `GoogleSheetLinkCopier` | Adding new Airtable links to the Sheet before scraping |
 | `VideoPlatform` (`YouTubePlatform`, `CachedPlatform`) | Find channels, list videos; the cache wraps the platform |
-| `LookupStrategy` (`ById`, `ByHandle`, `ByUsername`, `ByCustomUrl`) | One class per YouTube URL style |
+| `LookupStrategy` (`ById`, `ByHandle`, `ByUsername`, `ByCustomUrl`, `ByLegacyName`) | One class per YouTube channel URL style |
 | `VideoStore` (`CsvVideoStore`) | Where results are saved |
 | `VideoPublisher` (`ApiPublisher`, `RetryingPublisher`, `NullPublisher`) | Sending new videos to another API; the retrying wrapper queues failures |
 | `AccessTokenProvider` (`PasswordGrantTokenProvider`) | Gets and caches OAuth tokens |
