@@ -6,6 +6,9 @@ upload them to MissionEngine). Before scraping, it can add new YouTube links fro
 Airtable's Content Sources table to the Sheet.
 Intended to run weekly via Windows Task Scheduler.
 
+New here? Start with the one-page visual guide:
+https://indigitous.github.io/missionengine-tools-youtube/ (source: `docs/index.html`).
+
 ## Setup
 
 1. Enable **YouTube Data API v3** and **Google Sheets API** in a Google Cloud project.

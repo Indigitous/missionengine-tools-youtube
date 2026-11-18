@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="How the Indigitous YouTube tracker works: Airtable to Google Sheet to YouTube to MissionEngine, setup, commands and fixes.">
+<title>YouTube Tracker Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans:ital,wght@0,400;0,700;1,400&family=Noto+Sans+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: Indigitous Developer sub-brand. Dark page (neutral-900), panels in neutral-800, big overlapping green circles behind the header, thin green rules between parts. One look by design: always dark. */
+:root {
+  --page: #131313;        /* neutral-900, Indigitous Black */
+  --panel: #262626;       /* neutral-800 */
+  --well: #131313;        /* code wells inside panels */
+  --ink: #d9d9d6;         /* neutral-100 */
+  --muted: #c4bcb7;       /* warm-grey: secondary text */
+  --line: #3a3a3a;
+  --primary: #5cd400;     /* Developer green */
+  --secondary: #ef4e25;   /* Flame */
+  --on-color: #131313;    /* text on any brand fill */
+  --font-head: "Noto Sans Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --font-sub: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-body: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Noto Sans Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+:root { padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+}
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+h1, h2 { font-family: var(--font-head); font-weight: 400; text-wrap: balance; margin: 0; line-height: 1.2; letter-spacing: -0.01em; }
+h3 { font-family: var(--font-sub); font-weight: 700; text-wrap: balance; margin: 0; line-height: 1.3; }
+p { margin: 0; }
+code, .mono { font-family: var(--font-mono); font-size: 0.88em; }
+:not(pre) > code { background: var(--well); color: var(--ink); padding: 0.1em 0.35em; overflow-wrap: anywhere; }
+a { color: inherit; text-decoration-color: var(--primary); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+
+/* ---------- header with the sub-brand's circles ---------- */
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--primary); }
+.hero .circles { position: absolute; inset: 0; pointer-events: none; }
+.hero .circles span { position: absolute; border-radius: 9999px; }
+.hero .c1 { width: 420px; height: 420px; right: -120px; top: -150px; background: var(--primary); }
+.hero .c2 { width: 260px; height: 260px; right: 170px; top: 120px; border: 2px solid var(--primary); }
+.hero .c3 { width: 120px; height: 120px; right: 90px; top: 210px; background: var(--secondary); }
+header { position: relative; padding-block: 48px 40px; display: grid; gap: 16px; }
+header > * { max-width: 600px; }
+.eyebrow {
+  font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--primary); display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+}
+h1 { font-size: clamp(30px, 5.4vw, 48px); max-width: 16ch; }
+h1 .prompt { color: var(--primary); }
+.lede { font-size: 18px; color: var(--muted); max-width: 54ch; }
+.lede strong { color: var(--ink); }
+
+/* ---------- pipeline ---------- */
+.band { border-bottom: 1px solid var(--primary); }
+.band .wrap { padding-block: 36px 36px; display: grid; gap: 22px; }
+.band h2 { font-size: 24px; }
+.band .sub { color: var(--muted); font-size: 15px; max-width: 64ch; }
+.pipe { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; background: var(--panel); }
+.station { position: relative; display: grid; gap: 8px; align-content: start; padding: 20px 16px; min-width: 0; }
+.station + .station { border-left: 1px solid var(--line); }
+.station .num {
+  width: 40px; height: 40px; border-radius: 9999px; display: grid; place-items: center;
+  font-family: var(--font-mono); font-weight: 600; font-size: 16px;
+  background: var(--primary); color: var(--on-color);
+}
+.station.store .num { background: var(--secondary); }
+.station h3 { font-size: 17px; }
+.station p { font-size: 14px; color: var(--muted); }
+.station .tag { font-family: var(--font-mono); font-size: 12px; color: var(--primary); border: 1px solid var(--line); padding: 2px 6px; justify-self: start; overflow-wrap: anywhere; background: var(--well); }
+.station::after {
+  content: ""; position: absolute; right: -7px; top: 34px; width: 12px; height: 12px;
+  border-top: 2px solid var(--primary); border-right: 2px solid var(--primary); transform: rotate(45deg);
+  background: var(--panel); z-index: 1;
+}
+.station:last-child::after { display: none; }
+.band .note { font-size: 14.5px; color: var(--muted); }
+.band .note strong { color: var(--ink); }
+
+/* ---------- content grid ---------- */
+main .wrap { padding-block: 36px 56px; display: grid; gap: 28px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.block { background: var(--panel); padding: 24px; display: grid; gap: 16px; align-content: start; min-width: 0; }
+.block.wide { grid-column: 1 / -1; }
+.block h2 { font-size: 22px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.block h2 .chip { font-family: var(--font-mono); font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; background: var(--primary); color: var(--on-color); padding: 3px 10px; border-radius: 9999px; }
+.block > p { color: var(--muted); max-width: 65ch; }
+.block > p b, .block > p strong { color: var(--ink); }
+.block.feature { background: var(--primary); color: var(--on-color); }
+.block.feature > p, .block.feature li, .block.feature b { color: var(--on-color); }
+.block.feature :not(pre) > code { background: rgba(19,19,19,0.14); color: var(--on-color); }
+
+/* steps */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 18px; counter-reset: s; }
+.steps > li { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 14px; counter-increment: s; }
+.steps > li::before {
+  content: counter(s); width: 32px; height: 32px; border-radius: 9999px; display: grid; place-items: center;
+  border: 2px solid var(--primary); color: var(--primary); font-family: var(--font-mono); font-weight: 600; font-size: 14px;
+}
+.steps h3 { font-size: 16px; margin-bottom: 4px; }
+.steps .body { display: grid; gap: 8px; min-width: 0; }
+.steps .body p { color: var(--muted); font-size: 15px; }
+.steps .body p b { color: var(--ink); }
+
+/* link kinds */
+.kinds { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.kinds li { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 12px; padding-top: 10px; border-top: 1px solid rgba(19,19,19,0.3); }
+.kinds li:first-child { border-top: 0; padding-top: 0; }
+.kinds b, .kinds span { font-size: 15px; }
+.kinds code { font-size: 13px; }
+
+/* code with copy */
+.cmd { display: flex; align-items: stretch; background: var(--well); border: 1px solid var(--line); min-width: 0; }
+.cmd pre { margin: 0; padding: 10px 12px; overflow-x: auto; flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 13.5px; line-height: 1.5; color: var(--ink); }
+.cmd pre code::before { content: ""; }
+.cmd button {
+  flex: none; border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--primary);
+  font-family: var(--font-mono); font-size: 12px; padding: 0 12px; cursor: pointer;
+}
+.cmd button:hover { background: var(--panel); }
+
+/* env table */
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+th, td { text-align: left; padding: 10px 12px 10px 0; border-top: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--primary); font-weight: 600; border-top: 0; padding-top: 0; }
+td:first-child { white-space: nowrap; }
+td code { font-size: 13px; }
+td.what { color: var(--muted); }
+
+/* commands list */
+.cmds { display: grid; gap: 14px; }
+.cmds .row { display: grid; gap: 6px; min-width: 0; }
+.cmds .row p { font-size: 14.5px; color: var(--muted); }
+.cmds .row p strong { color: var(--ink); }
+
+/* files */
+.files { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 14px; }
+.file { border-top: 2px solid var(--primary); padding-top: 10px; display: grid; gap: 4px; min-width: 0; }
+.file code { font-size: 13.5px; font-weight: 600; background: none; padding: 0; color: var(--ink); }
+.file p { font-size: 14px; color: var(--muted); }
+.file.warn { border-top-color: var(--secondary); }
+.file.warn .flag { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; background: var(--secondary); color: var(--on-color); padding: 1px 6px; justify-self: start; }
+
+/* troubleshooting */
+.fixes { display: grid; gap: 0; }
+.fix { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 16px; padding-block: 12px; border-top: 1px solid var(--line); }
+.fix:first-child { border-top: 0; padding-top: 0; }
+.fix .sym { font-family: var(--font-mono); font-size: 13.5px; color: var(--primary); overflow-wrap: anywhere; }
+.fix .do { font-size: 14.5px; color: var(--muted); }
+.fix .do strong { color: var(--ink); }
+
+.callout { background: var(--well); padding: 14px 16px; font-size: 14.5px; display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 12px; align-items: start; }
+.callout::before { content: ""; width: 14px; height: 14px; border-radius: 9999px; background: var(--secondary); margin-top: 4px; }
+.callout p { color: var(--ink); }
+
+footer { border-top: 1px solid var(--primary); }
+footer .wrap { padding-block: 20px 32px; font-size: 13.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between; }
+footer .mono { color: var(--primary); }
+
+/* Keep the circles clear of the header text: below 1100px only the corner circle stays. */
+@media (max-width: 1100px) {
+  .hero .c2, .hero .c3 { display: none; }
+  .hero .c1 { width: 300px; height: 300px; right: -170px; top: -110px; }
+}
+@media (max-width: 860px) {
+  .pipe { grid-template-columns: minmax(0, 1fr); }
+  .station, .station + .station { padding: 16px 16px 16px 72px; border-left: 0; border-top: 1px solid var(--line); }
+  .station:first-child { border-top: 0; }
+  .station .num { position: absolute; left: 16px; top: 16px; }
+  .station::after { right: auto; left: 30px; top: auto; bottom: -7px; transform: rotate(135deg); }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .files { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .hero .c1 { width: 200px; height: 200px; right: -110px; top: -90px; }
+  .eyebrow { padding-right: 96px; }
+  .files { grid-template-columns: minmax(0, 1fr); }
+  .fix { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .kinds li { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  td:first-child { white-space: normal; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="hero">
+  <div class="circles" aria-hidden="true"><span class="c1"></span><span class="c2"></span><span class="c3"></span></div>
+  <header class="wrap">
+    <div class="eyebrow">Indigitous: Developer · MissionEngine tools</div>
+    <h1><span class="prompt">&gt;</span> How the YouTube tracker works</h1>
+    <p class="lede">Every week, it finds <strong>new YouTube videos</strong> from the channels Indigitous follows and sends them to <strong>MissionEngine</strong>. To follow a new channel, add its link to Airtable. The tracker handles the rest.</p>
+  </header>
+</div>
+
+<section class="band" aria-labelledby="flow-title">
+  <div class="wrap">
+    <h2 id="flow-title">What happens on each run</h2>
+    <p class="sub">One command, <code>python yt_tracker.py</code>, does all five steps in order. Task Scheduler runs it once a week.</p>
+    <ol class="pipe">
+      <li class="station">
+        <span class="num">1</span>
+        <h3>Airtable</h3>
+        <p>Reads YouTube links from the <b>Content Sources</b> table in the Indigitous - People base.</p>
+        <span class="tag">URL field</span>
+      </li>
+      <li class="station">
+        <span class="num">2</span>
+        <h3>Google Sheet</h3>
+        <p>Adds any link that isn't in the Sheet yet as a new row. Existing rows are never changed.</p>
+        <span class="tag">channel_url column</span>
+      </li>
+      <li class="station">
+        <span class="num">3</span>
+        <h3>YouTube</h3>
+        <p>Checks every channel in the Sheet for videos posted since the last run.</p>
+        <span class="tag">YouTube Data API</span>
+      </li>
+      <li class="station store">
+        <span class="num">4</span>
+        <h3>Saved locally</h3>
+        <p>Adds the new videos to a CSV file, so there's always a record on disk.</p>
+        <span class="tag">new_videos.csv</span>
+      </li>
+      <li class="station">
+        <span class="num">5</span>
+        <h3>MissionEngine</h3>
+        <p>Uploads each new video. The API skips any video it already has.</p>
+        <span class="tag">POST /events</span>
+      </li>
+    </ol>
+    <p class="note"><strong>Only the Google Sheet gets scraped.</strong> Airtable just adds new links to it. If the Airtable step fails, the error is logged and steps 3 to 5 still run.</p>
+  </div>
+</section>
+
+<main>
+  <div class="wrap">
+    <div class="grid">
+
+      <section class="block feature" aria-labelledby="add-title">
+        <h2 id="add-title">Follow a new channel</h2>
+        <p>Paste its YouTube link into the <b>URL</b> field of a new row in <b>Content Sources</b>. That's all. On the next run, the tracker copies it to the Sheet and scrapes it. You can also add a row to the Sheet directly.</p>
+        <ul class="kinds">
+          <li><b>Channel</b><span><code>/@handle</code>, <code>/channel/…</code>, <code>/user/…</code>, <code>/c/…</code> or <code>youtube.com/name</code>. Gets every new upload from that channel.</span></li>
+          <li><b>Playlist</b><span><code>/playlist?list=…</code>. Gets new videos in that playlist only.</span></li>
+          <li><b>Single video</b><span><code>watch?v=…</code>, <code>youtu.be/…</code>, <code>/shorts/…</code>. Sends that one video once.</span></li>
+        </ul>
+        <p>The first time a channel is scraped, how far back it looks depends on <code>new_channel_lookback_days</code> in <code>config.json</code>. Set to <code>"all"</code>, it gets the channel's whole history, so the first run can take hours.</p>
+      </section>
+
+      <section class="block" aria-labelledby="setup-title">
+        <h2 id="setup-title"><span class="chip">Once</span>Set up a computer</h2>
+        <ol class="steps">
+          <li><div class="body">
+            <h3>Get the code</h3>
+            <div class="cmd"><pre><code>git clone https://github.com/Indigitous/missionengine-tools-youtube
+cd missionengine-tools-youtube
+pip install -r requirements.txt</code></pre><button type="button" data-copy aria-label="Copy the get-the-code commands">Copy</button></div>
+          </div></li>
+          <li><div class="body">
+            <h3>Set the four keys</h3>
+            <p>Set them with <code>setx</code> (see the table below), then open a new terminal.</p>
+          </div></li>
+          <li><div class="body">
+            <h3>Add the Google key file</h3>
+            <p>Put <code>service_account.json</code> next to the script. Share the Google Sheet with the <code>client_email</code> inside it as <b>Editor</b>, so new rows can be added.</p>
+          </div></li>
+          <li><div class="body">
+            <h3>Make your config</h3>
+            <p>Copy <code>config.example.json</code> to <code>config.json</code>. Fill in <code>sheet_id</code>, the <code>airtable</code> block, and the <code>upload</code> block with <code>"enabled": true</code>.</p>
+          </div></li>
+          <li><div class="body">
+            <h3>Test without sending anything</h3>
+            <div class="cmd"><pre><code>python yt_tracker.py --check-upload
+python yt_tracker.py --copy-to-sheet --dry-run</code></pre><button type="button" data-copy aria-label="Copy the test commands">Copy</button></div>
+          </div></li>
+        </ol>
+      </section>
+
+      <section class="block wide" aria-labelledby="keys-title">
+        <h2 id="keys-title">The keys it needs</h2>
+        <p>Keys are stored as environment variables, never in a file, so they can't end up on GitHub by accident.</p>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th scope="col">Variable</th><th scope="col">What it's for</th><th scope="col">Where to get it</th></tr></thead>
+            <tbody>
+              <tr><td><code>YOUTUBE_API_KEY</code></td><td>Reading channels and videos</td><td class="what">Google Cloud: an API key with YouTube Data API v3 turned on</td></tr>
+              <tr><td><code>AIRTABLE_TOKEN</code></td><td>Reading Content Sources</td><td class="what">airtable.com/create/tokens: <code>data.records:read</code> scope, access to Indigitous - People</td></tr>
+              <tr><td><code>UPLOAD_API_USERNAME</code></td><td>Logging in to MissionEngine</td><td class="what">Your MissionEngine API account</td></tr>
+              <tr><td><code>UPLOAD_API_PASSWORD</code></td><td>Logging in to MissionEngine</td><td class="what">Your MissionEngine API account</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="cmd"><pre><code>setx YOUTUBE_API_KEY "your_key"</code></pre><button type="button" data-copy aria-label="Copy the setx example">Copy</button></div>
+      </section>
+
+      <section class="block" aria-labelledby="run-title">
+        <h2 id="run-title"><span class="chip">Daily use</span>Commands</h2>
+        <div class="cmds">
+          <div class="row">
+            <div class="cmd"><pre><code>python yt_tracker.py</code></pre><button type="button" data-copy aria-label="Copy the full run command">Copy</button></div>
+            <p><strong>The full run.</strong> All five steps: Airtable, Sheet, YouTube, CSV, MissionEngine.</p>
+          </div>
+          <div class="row">
+            <div class="cmd"><pre><code>python yt_tracker.py --check-airtable</code></pre><button type="button" data-copy aria-label="Copy the check Airtable command">Copy</button></div>
+            <p>Lists the YouTube links in Airtable. Changes nothing.</p>
+          </div>
+          <div class="row">
+            <div class="cmd"><pre><code>python yt_tracker.py --copy-to-sheet --dry-run</code></pre><button type="button" data-copy aria-label="Copy the copy-to-sheet dry run command">Copy</button></div>
+            <p>Shows which links would be added to the Sheet. Drop <code>--dry-run</code> to add them, without scraping.</p>
+          </div>
+          <div class="row">
+            <div class="cmd"><pre><code>python yt_tracker.py --check-upload</code></pre><button type="button" data-copy aria-label="Copy the check upload command">Copy</button></div>
+            <p>Tests the MissionEngine login. Sends nothing.</p>
+          </div>
+          <div class="row">
+            <div class="cmd"><pre><code>python yt_tracker.py --check-resources</code></pre><button type="button" data-copy aria-label="Copy the check resources command">Copy</button></div>
+            <p>Looks for your 10 most recent videos in MissionEngine, to confirm they arrived.</p>
+          </div>
+          <div class="row">
+            <div class="cmd"><pre><code>python upload_csv.py --dry-run</code></pre><button type="button" data-copy aria-label="Copy the upload CSV dry run command">Copy</button></div>
+            <p>Counts what's in <code>new_videos.csv</code>. Drop <code>--dry-run</code> to resend all of it without scraping. Duplicates are skipped.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" aria-labelledby="sched-title">
+        <h2 id="sched-title"><span class="chip">Weekly</span>Schedule it</h2>
+        <p>Create a Windows task that runs the full run every Monday at 9:00. Change both paths to match your computer.</p>
+        <div class="cmd"><pre><code>schtasks /Create /TN "YouTubeTracker" /SC WEEKLY /D MON /ST 09:00 /TR "\"C:\Path\to\python.exe\" \"C:\Path\to\yt_tracker.py\""</code></pre><button type="button" data-copy aria-label="Copy the schedule command">Copy</button></div>
+        <p>Then open Task Scheduler and turn on <b>"Run task as soon as possible after a scheduled start is missed"</b>, so a computer that was asleep catches up.</p>
+        <div class="callout"><p>A <b>Last Run Result</b> of <code>0x1</code> means something failed, usually the upload. Open <code>yt_tracker.log</code> to see why. Failed uploads are retried automatically on the next run.</p></div>
+      </section>
+
+      <section class="block wide" aria-labelledby="files-title">
+        <h2 id="files-title">Files next to the script</h2>
+        <div class="files">
+          <div class="file"><code>yt_tracker.log</code><p>What happened on every run. Look here first.</p></div>
+          <div class="file"><code>new_videos.csv</code><p>Every video found, newest at the bottom.</p></div>
+          <div class="file"><code>state.json</code><p>When each channel was last checked. Delete a channel's entry to fetch it again from the start.</p></div>
+          <div class="file"><code>pending_upload.json</code><p>Videos that didn't upload yet. They're sent first next run.</p></div>
+          <div class="file"><code>rejected_uploads.json</code><p>Videos MissionEngine refused, with the reason.</p></div>
+          <div class="file"><code>channel_cache.json</code><p>Channel lookups, saved to use less YouTube quota.</p></div>
+          <div class="file warn"><span class="flag">Secret</span><code>config.json</code><p>Your settings. Never commit it.</p></div>
+          <div class="file warn"><span class="flag">Secret</span><code>service_account.json</code><p>The Google key. Never commit or share it.</p></div>
+          <div class="file"><code>config.example.json</code><p>The template to copy. Safe to commit.</p></div>
+        </div>
+      </section>
+
+      <section class="block wide" aria-labelledby="fix-title">
+        <h2 id="fix-title">When something goes wrong</h2>
+        <div class="fixes">
+          <div class="fix"><span class="sym">Could not resolve channel: &lt;link&gt;</span><p class="do">YouTube couldn't find that link. <strong>Open it in a browser</strong> and fix it in Airtable or the Sheet. It's retried every run.</p></div>
+          <div class="fix"><span class="sym">Google Sheets refused the write (HTTP 403)</span><p class="do">The service account can only view the Sheet. <strong>Share the Sheet with it as Editor.</strong> Scraping still runs.</p></div>
+          <div class="fix"><span class="sym">Airtable returned HTTP 401 / 403</span><p class="do">The token is wrong or can't see the base. <strong>Check <code>AIRTABLE_TOKEN</code></strong> and its access to Indigitous - People.</p></div>
+          <div class="fix"><span class="sym">upload FAILED (queued for retry)</span><p class="do">MissionEngine couldn't be reached. <strong>Nothing to do.</strong> The videos wait in <code>pending_upload.json</code> and go next run.</p></div>
+          <div class="fix"><span class="sym">… environment variable … not set / must be set</span><p class="do">A key is missing. <strong>Run <code>setx</code> again and open a new terminal.</strong> A scheduled task may only see a new key after you sign out and back in.</p></div>
+          <div class="fix"><span class="sym">quotaExceeded</span><p class="do">YouTube's daily limit (10,000 units) was used up, usually by a big first run. <strong>Wait a day.</strong> Channels that didn't finish are tried again on the next run.</p></div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Code: <span class="mono">github.com/Indigitous/missionengine-tools-youtube</span></span>
+    <span>Full details are in the README in the repo.</span>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll("[data-copy]").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var code = btn.parentElement.querySelector("code");
+    var text = code.textContent;
+    function done(label) { btn.textContent = label; setTimeout(function () { btn.textContent = "Copy"; }, 1600); }
+    function selectIt() {
+      var range = document.createRange(); range.selectNodeContents(code);
+      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      done("Selected");
+    }
+    try {
+      navigator.clipboard.writeText(text).then(function () { done("Copied"); }, selectIt);
+    } catch (e) { selectIt(); }
+  });
+});
+</script>
+</body>
+</html>
