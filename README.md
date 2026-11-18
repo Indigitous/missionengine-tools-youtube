@@ -6,8 +6,8 @@ upload them to MissionEngine). Before scraping, it can add new YouTube links fro
 Airtable's Content Sources table to the Sheet.
 Intended to run weekly via Windows Task Scheduler.
 
-New here? Start with the one-page visual guide in [`docs/index.html`](docs/index.html).
-Download it or open it from a clone in any browser.
+New here? Start with the one-page visual guide:
+https://indigitous.github.io/missionengine-tools-youtube/ (source: [`docs/index.html`](docs/index.html)).
 
 ## Setup
 
