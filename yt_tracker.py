@@ -586,8 +586,14 @@ class AirtableLinkReader:
         s = self._settings
         endpoint = f"{self.API}/{s.base_id}/{requests.utils.quote(s.table, safe='')}"
         headers = {"Authorization": f"Bearer {self._token}"}
-        params: Dict[str, Any] = {"pageSize": 100,
-                                  "fields[]": [f for f in (s.url_field, s.attribution_field) if f]}
+        # Ask Airtable for YouTube rows only: the table has thousands of other links, and reading
+        # them all costs one request per 100 records. youtube_links() still checks each link.
+        field_text = 'LOWER({%s}&"")' % s.url_field.replace("}", "\\}")
+        params: Dict[str, Any] = {
+            "pageSize": 100,
+            "fields[]": [f for f in (s.url_field, s.attribution_field) if f],
+            "filterByFormula": f'OR(FIND("youtube.com", {field_text}), FIND("youtu.be", {field_text}))',
+        }
         if s.view:
             params["view"] = s.view
 
