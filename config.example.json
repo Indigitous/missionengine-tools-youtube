@@ -9,6 +9,7 @@
   "sheet_id": "PASTE_YOUR_SPREADSHEET_ID_HERE",
   "sheet_tab": "Sheet1",
   "url_column_header": "channel_url",
+  "priority_column_header": "priority",
   "service_account_file": "service_account.json",
   "new_channel_lookback_days": 7,
   "upload": {

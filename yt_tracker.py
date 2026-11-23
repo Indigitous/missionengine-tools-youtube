@@ -363,6 +363,7 @@ class Settings:
     sheet_id: str = ""
     sheet_tab: str = "Sheet1"
     url_column_header: str = "channel_url"
+    priority_column_header: str = "priority"   # rows marked FALSE here are skipped; blank or missing = scrape
     service_account_file: str = "service_account.json"
     new_channel_lookback_days: Optional[int] = 7   # None means "all": every video, from the beginning
     upload: UploadSettings = field(default_factory=UploadSettings)
@@ -407,6 +408,7 @@ class Settings:
             sheet_id=sheet_id,
             sheet_tab=cfg.get("sheet_tab", cls.sheet_tab),
             url_column_header=cfg.get("url_column_header", cls.url_column_header),
+            priority_column_header=str(cfg.get("priority_column_header", cls.priority_column_header)).strip(),
             service_account_file=cfg.get("service_account_file", cls.service_account_file),
             new_channel_lookback_days=cls._parse_lookback(lookback),
             upload=UploadSettings.from_dict(cfg.get("upload")),
@@ -485,11 +487,25 @@ class ChannelSource(ABC):
         """Return de-duplicated channel URLs. Raise ChannelSourceError on failure."""
 
 
+FALSE_VALUES = {"false", "no", "n", "0", "off"}
+
+
+def is_false(value: str) -> bool:
+    """True only for an explicit "no" (a Sheets checkbox reads as "FALSE"). Blank is not false."""
+    return value.strip().lower() in FALSE_VALUES
+
+
 class GoogleSheetChannelSource(ChannelSource):
-    def __init__(self, sheet_id: str, tab: str, url_column_header: str, credentials_file: Path):
+    """
+    Reads channel URLs from the Sheet. If the tab has a `priority` column (a checkbox or
+    TRUE/FALSE), rows set to FALSE are skipped. Blank cells, or no such column, mean "scrape it".
+    """
+    def __init__(self, sheet_id: str, tab: str, url_column_header: str, credentials_file: Path,
+                 priority_column_header: str = "priority"):
         self._sheet_id = sheet_id
         self._tab = tab
         self._header = url_column_header
+        self._priority_header = priority_column_header
         self._credentials_file = credentials_file
 
     def channel_urls(self) -> List[str]:
@@ -521,14 +537,23 @@ class GoogleSheetChannelSource(ChannelSource):
             raise ChannelSourceError(
                 f"Column '{self._header}' not found. Headers seen: {rows[0]}")
         col = header.index(self._header.lower())
+        priority = self._priority_header.lower()
+        priority_col = header.index(priority) if priority and priority in header else None
 
-        urls, seen = [], set()
+        urls, seen, skipped = [], set(), 0
         for row in rows[1:]:
             if len(row) > col:
                 url = row[col].strip()
-                if url and url not in seen:
+                if not url:
+                    continue
+                if priority_col is not None and len(row) > priority_col and is_false(row[priority_col]):
+                    skipped += 1
+                    continue
+                if url not in seen:
                     seen.add(url)
                     urls.append(url)
+        if skipped:
+            log.info("Skipped %d row(s) with %s = FALSE", skipped, self._priority_header)
         return urls
 
 
@@ -631,12 +656,18 @@ def channel_name_from_url(url: str) -> str:
 
 
 class GoogleSheetLinkCopier:
-    """Adds links that aren't in the Google Sheet yet as new rows. Never changes or removes a row."""
+    """
+    Adds links that aren't in the Google Sheet yet as new rows. Never changes or removes a row.
+    New rows get priority = FALSE (if the tab has that column), so they are not scraped until
+    someone ticks them.
+    """
 
-    def __init__(self, sheet_id: str, tab: str, url_column_header: str, credentials_file: Path, sheets=None):
+    def __init__(self, sheet_id: str, tab: str, url_column_header: str, credentials_file: Path, sheets=None,
+                 priority_column_header: str = "priority"):
         self._sheet_id = sheet_id
         self._tab = tab
         self._header = url_column_header
+        self._priority_header = priority_column_header
         self._credentials_file = credentials_file
         self._sheets_api = sheets
 
@@ -660,6 +691,8 @@ class GoogleSheetLinkCopier:
             existing.add(key)
             values = {self._header.lower(): url, "channel_name": channel_name_from_url(url),
                       "attribution": attribution, "is_processed": "0"}
+            if self._priority_header:
+                values[self._priority_header.lower()] = False   # a real boolean, so a checkbox shows unticked
             new_rows.append([values.get(h, "") for h in header])
             added.append(url)
 
@@ -682,7 +715,8 @@ class GoogleSheetLinkCopier:
 def copy_airtable_to_sheet(settings: "Settings", dry_run: bool = False) -> List[str]:
     links = AirtableLinkReader(settings.airtable, load_airtable_token()).youtube_links()
     copier = GoogleSheetLinkCopier(settings.sheet_id, settings.sheet_tab, settings.url_column_header,
-                                   service_account_path(settings))
+                                   service_account_path(settings),
+                                   priority_column_header=settings.priority_column_header)
     try:
         added = copier.copy(links, dry_run=dry_run)
     except HttpError as e:
@@ -1636,7 +1670,8 @@ def build_tracker(settings: Settings, api_key: str) -> Tracker:
 
     return Tracker(
         source=GoogleSheetChannelSource(
-            settings.sheet_id, settings.sheet_tab, settings.url_column_header, key_file),
+            settings.sheet_id, settings.sheet_tab, settings.url_column_header, key_file,
+            settings.priority_column_header),
         platform=platform,
         store=CsvVideoStore(OUTPUT_CSV),
         history=history,

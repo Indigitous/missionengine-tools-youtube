@@ -23,6 +23,9 @@ https://indigitous.github.io/missionengine-tools-youtube/ (source: [`docs/index.
    - `sheet_id` - the long ID in your sheet's URL (between `/d/` and `/edit`)
    - `sheet_tab` - tab name holding the channel list
    - `url_column_header` - header of the column with channel URLs
+   - `priority_column_header` - header of an optional TRUE/FALSE column (default
+     `priority`; a checkbox works). Rows set to `FALSE` are skipped. Blank cells,
+     or no such column at all, mean the row is scraped.
    - `service_account_file` - path to the key file (relative paths are resolved
      next to the script; use forward slashes in JSON paths)
    - `new_channel_lookback_days` - how many days back to look for a channel that
@@ -60,6 +63,8 @@ Each new row gets:
 - `attribution` - the Airtable field named in `attribution_field`
   (default `Short Description`), if it has a value
 - `is_processed` - `0`
+- `priority` - `FALSE`, so the new channel is **not** scraped until you tick it
+  (only if the Sheet has a `priority` column)
 
 Other columns are left blank.
 
